@@ -27,7 +27,7 @@ if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
 fi
 
-# Default modem port if not set in config or arg
+# Default modem port
 MODEM_PORT=${MODEM_PORT:-/dev/ttyUSB2}
 
 # Define the AWK processor logic
@@ -55,6 +55,8 @@ EOF
 
 echo "timestamp,lat,lon,cell_type,state,technology,duplex_mode,mcc,mnc,cellid,pcid,tac,arfcn,band,ns_dl_bw,rsrp,rsrq,sinr,scs,srxlev"
 
+LAST_GPS_WARN=0
+
 while true; do
   if [ "$HAS_NANOSECONDS" = true ]; then
       timestamp=$(($(date +%s%N)/1000000))
@@ -62,9 +64,22 @@ while true; do
       timestamp=$(($(date +%s)*1000))
   fi
   
-  lat_lon=$(gpspipe -w -n 8 2>/dev/null | grep TPV | grep -om1 "[-]\?[[:digit:]]\{1,3\}\.[[:digit:]]\+" | tr '\n' ',')
-  [ -z "$lat_lon" ] && lat_lon=","
+  # lat lon position from gps (robust regex for variable precision)
+  # We use a smaller -n value to avoid blocking the signal logging too long if GPS is slow
+  lat_lon=$(gpspipe -w -n 5 2>/dev/null | grep TPV | grep -om1 "[-]\?[[:digit:]]\{1,3\}\.[[:digit:]]\+" | tr '\n' ',')
+  
+  # maintain CSV column alignment if GPS is unavailable
+  if [ -z "$lat_lon" ]; then
+      lat_lon=","
+      # Rate-limited warning to stderr (every 10s)
+      now=$(date +%s)
+      if [ $((now - LAST_GPS_WARN)) -ge 10 ]; then
+          echo "Warning: No GPS fix at $(date)" >&2
+          LAST_GPS_WARN=$now
+      fi
+  fi
 
+  # query modem
   modem_output=$(echo 'AT+QENG="servingcell"' | atinout - "$MODEM_PORT" - 2>/dev/null | grep '+QENG:')
   
   if [ -n "$modem_output" ]; then
