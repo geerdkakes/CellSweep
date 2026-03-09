@@ -1,122 +1,144 @@
 #!/usr/bin/env bash
 
-# --- Configuration ---
-# Define nodes. If you are at home, use the hostname. 
-# If in the field, the script will try to reach them by IP.
-NODES=("apu3lte" "apu3")
+# --- Configuration Loading ---
+CONFIG_FILE="$(dirname "$0")/config.env"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Error: Configuration file $CONFIG_FILE not found."
+    exit 1
+fi
+source "$CONFIG_FILE"
 
-declare -A FIELD_IPS
-FIELD_IPS["apu3lte"]="192.168.3.2"
-FIELD_IPS["apu3"]="192.168.3.3"
-
-REMOTE_SCRIPT_PATH="/tmp/logsignalstrength.sh"
-REMOTE_LOG_DIR="/tmp/cell_sweep_logs"
+# --- Internal Variables ---
+# The script is in the testnodes/ subfolder of the repo root
+REMOTE_SCRIPT="${REMOTE_REPO_ROOT}/testnodes/logsignalstrength.sh"
 
 # --- Helper Functions ---
 
+# node_entry format: "name|field_ip|user"
+get_node_name() { echo "${1%%|*}"; }
+get_node_ip()   { local tmp="${1#*|}"; echo "${tmp%%|*}"; }
+get_node_user() { echo "${1##*|}"; }
+
 get_node_addr() {
-    local name=$1
-    # Try pinging the name first (Home mode)
+    local entry=$1
+    local name=$(get_node_name "$entry")
+    local ip=$(get_node_ip "$entry")
+    
     if ping -c 1 -W 1 "$name" >/dev/null 2>&1; then
         echo "$name"
     else
-        # Fallback to Field IP
-        echo "${FIELD_IPS[$name]}"
+        echo "$ip"
     fi
 }
 
-usage() {
-    echo "Usage: $0 {start|stop|status|fetch|deploy} [node_name]"
-    echo "Nodes: ${NODES[*]} (or 'all')"
-    exit 1
-}
-
-run_on_node() {
-    local node=$1
-    local cmd=$2
-    local addr=$(get_node_addr "$node")
-
-    if [ -z "$addr" ]; then
-        echo "[$node] Error: Could not resolve address."
-        return 1
+generate_session_id() {
+    local date_str=$(date +%Y%m%d)
+    local seq="01"
+    
+    if [ -d "$LOCAL_BASE_DATADIR" ]; then
+        local last_session=$(ls -1 "$LOCAL_BASE_DATADIR" | grep "^${date_str}_" | sort | tail -n 1)
+        if [ -n "$last_session" ]; then
+            local last_seq=$(echo "$last_session" | cut -d'_' -f2 | cut -d'-' -f1)
+            seq=$(printf "%02d" $((10#$last_seq + 1)))
+        fi
     fi
-
-    echo "[$node] Executing at $addr..."
-    ssh -o ConnectTimeout=2 "$addr" "$cmd"
+    echo "${date_str}_${seq}"
 }
 
 # --- Actions ---
 
-deploy() {
-    local node=$1
-    local addr=$(get_node_addr "$node")
-    echo "[$node] Deploying latest script to $addr..."
-    scp -o ConnectTimeout=2 "testnodes/logsignalstrength.sh" "$addr:$REMOTE_SCRIPT_PATH"
-    ssh "$addr" "chmod +x $REMOTE_SCRIPT_PATH && mkdir -p $REMOTE_LOG_DIR"
-}
-
 start_logging() {
-    local node=$1
-    local addr=$(get_node_addr "$node")
-    local timestamp=$(date +%Y%m%d_%H%M%S)
-    local log_file="$REMOTE_LOG_DIR/sweep_${node}_${timestamp}.csv"
+    local suffix=$1
+    local session_id=$(generate_session_id)
+    [ -n "$suffix" ] && session_id="${session_id}-${suffix}"
+    
+    echo "Starting Session: $session_id"
+    
+    for entry in "${NODES[@]}"; do
+        local name=$(get_node_name "$entry")
+        local user=$(get_node_user "$entry")
+        local addr=$(get_node_addr "$entry")
+        local remote_dir="${REMOTE_BASE_DATADIR}/${session_id}"
+        local log_file="${remote_dir}/sweep_${name}.csv"
 
-    # 1. Deploy first to ensure consistency
-    deploy "$node"
-
-    echo "[$node] Starting background logging to $log_file..."
-    # We use nohup and redirect to a file. 
-    # The 'disown' equivalent in a remote shell is ensuring the process is detached.
-    ssh "$addr" "nohup $REMOTE_SCRIPT_PATH > $log_file 2>&1 &"
+        echo "[$name] Starting at ${user}@${addr}..."
+        ssh "${user}@${addr}" "mkdir -p \"$remote_dir\" && nohup $REMOTE_SCRIPT > \"$log_file\" 2>&1 &"
+    done
+    echo "$session_id" > "$(dirname "$0")/.current_session"
 }
 
 stop_logging() {
-    local node=$1
-    echo "[$node] Stopping logging process..."
-    run_on_node "$node" "pkill -f logsignalstrength.sh"
+    for entry in "${NODES[@]}"; do
+        local name=$(get_node_name "$entry")
+        local user=$(get_node_user "$entry")
+        local addr=$(get_node_addr "$entry")
+        echo "[$name] Stopping..."
+        ssh "${user}@${addr}" "pkill -f logsignalstrength.sh"
+    done
 }
 
 check_status() {
-    local node=$1
-    local addr=$(get_node_addr "$node")
-    local pid=$(ssh "$addr" "pgrep -f logsignalstrength.sh")
-    if [ -n "$pid" ]; then
-        echo "[$node] RUNNING (PID: $pid)"
-    else
-        echo "[$node] STOPPED"
-    fi
+    for entry in "${NODES[@]}"; do
+        local name=$(get_node_name "$entry")
+        local user=$(get_node_user "$entry")
+        local addr=$(get_node_addr "$entry")
+        local pid=$(ssh "${user}@${addr}" "pgrep -f logsignalstrength.sh")
+        printf "[%-10s] %s\n" "$name" "${pid:+RUNNING (PID: $pid)}${pid:-STOPPED}"
+    done
 }
 
 fetch_logs() {
-    local node=$1
-    local addr=$(get_node_addr "$node")
-    local local_dir="logs/${node}"
-    mkdir -p "$local_dir"
-    echo "[$node] Fetching logs from $addr..."
-    scp "$addr:$REMOTE_LOG_DIR/*.csv" "$local_dir/" 2>/dev/null || echo "[$node] No logs found."
+    local target_session=$1
+    local date_filter=$(date +%Y%m%d)
+
+    # If 'remaining' or no arg, we sync everything for today
+    if [ "$target_session" == "remaining" ] || [ -z "$target_session" ]; then
+        echo "Syncing all remaining logs for today ($date_filter)..."
+        for entry in "${NODES[@]}"; do
+            local name=$(get_node_name "$entry")
+            local user=$(get_node_user "$entry")
+            local addr=$(get_node_addr "$entry")
+            
+            # List remote sessions for today
+            local remote_sessions=$(ssh "${user}@${addr}" "ls -1 $REMOTE_BASE_DATADIR 2>/dev/null | grep '^${date_filter}_'")
+            
+            for s_id in $remote_sessions; do
+                local local_dir="${LOCAL_BASE_DATADIR}/${s_id}"
+                mkdir -p "$local_dir"
+                echo "[$name] Fetching session $s_id..."
+                # Use rsync if available for efficiency, fallback to scp
+                if command -v rsync >/dev/null; then
+                    rsync -az "${user}@${addr}:${REMOTE_BASE_DATADIR}/${s_id}/" "$local_dir/"
+                else
+                    scp -r "${user}@${addr}:${REMOTE_BASE_DATADIR}/${s_id}/*" "$local_dir/" 2>/dev/null
+                fi
+            done
+        done
+    else
+        # Fetch specific session
+        for entry in "${NODES[@]}"; do
+            local name=$(get_node_name "$entry")
+            local user=$(get_node_user "$entry")
+            local addr=$(get_node_addr "$entry")
+            local local_dir="${LOCAL_BASE_DATADIR}/${target_session}"
+            mkdir -p "$local_dir"
+            echo "[$name] Fetching $target_session..."
+            scp -r "${user}@${addr}:${REMOTE_BASE_DATADIR}/${target_session}/*" "$local_dir/" 2>/dev/null
+        done
+    fi
 }
 
-# --- Command Routing ---
+usage() {
+    echo "Usage: $0 {start|stop|status|fetch} [arg]"
+    echo "  start [suffix]    - Start a new session"
+    echo "  fetch [session]   - Download logs (use 'remaining' for all today's sessions)"
+    exit 1
+}
 
-COMMAND=$1
-TARGET_NODE=$2
-
-if [ -z "$COMMAND" ]; then usage; fi
-
-# Determine which nodes to target
-if [ -z "$TARGET_NODE" ] || [ "$TARGET_NODE" == "all" ]; then
-    TARGETS=("${NODES[@]}")
-else
-    TARGETS=("$TARGET_NODE")
-fi
-
-for node in "${TARGETS[@]}"; do
-    case "$COMMAND" in
-        deploy) deploy "$node" ;;
-        start)  start_logging "$node" ;;
-        stop)   stop_logging "$node" ;;
-        status) check_status "$node" ;;
-        fetch)  fetch_logs "$node" ;;
-        *)      usage ;;
-    esac
-done
+case "$1" in
+    start)  start_logging "$2" ;;
+    stop)   stop_logging ;;
+    status) check_status ;;
+    fetch)  fetch_logs "$2" ;;
+    *)      usage ;;
+esac
