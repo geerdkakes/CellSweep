@@ -24,6 +24,8 @@ PORT_UP=$(echo "${IPERF_PORTS:-5201}" | cut -d',' -f2)
 
 # --- Helper Functions ---
 
+SSH_OPTS="-o ConnectTimeout=10 -o BatchMode=yes"
+
 run_cmd() {
     local node_user=$1
     local addr=$2
@@ -31,7 +33,7 @@ run_cmd() {
     if [ "$DRY_RUN" = "true" ]; then
         echo "[DRY-RUN] ssh ${node_user}@${addr} '$cmd'" >&2
     else
-        ssh "${node_user}@${addr}" "$cmd"
+        ssh $SSH_OPTS "${node_user}@${addr}" "$cmd"
     fi
 }
 
@@ -47,20 +49,48 @@ run_bg_cmd() {
     if [ "$DRY_RUN" = "true" ]; then
         echo "[DRY-RUN] ssh -n ${node_user}@${addr} '{ $cmd; } </dev/null &>/dev/null &'" >&2
     else
-        ssh -n "${node_user}@${addr}" "{ $cmd; } </dev/null &>/dev/null &"
+        ssh -n $SSH_OPTS "${node_user}@${addr}" "{ $cmd; } </dev/null &>/dev/null &"
     fi
 }
 
 get_node_name() { echo "${1%%|*}"; }
-get_node_ip()   { local tmp="${1#*|}"; echo "${tmp%%|*}"; }
+get_node_addr() { local tmp="${1#*|}"; echo "${tmp%%|*}"; }
 get_node_user() { echo "${1##*|}"; }
 
-get_node_addr() {
-    local entry=$1
-    local name=$(get_node_name "$entry")
-    local ip=$(get_node_ip "$entry")
-    if [ "$DRY_RUN" = "true" ]; then echo "$name"; return; fi
-    ping -c 1 -W 1 "$name" >/dev/null 2>&1 && echo "$name" || echo "$ip"
+# Kill each process pattern on a remote node, then verify each one stopped.
+# Usage: kill_procs <signal> <user> <addr> <name> <pattern> [pattern ...]
+#   signal: "" for SIGTERM, "-9" for SIGKILL
+kill_procs() {
+    local signal=$1 user=$2 addr=$3 name=$4
+    shift 4
+
+    for pattern in "$@"; do
+        run_cmd "$user" "$addr" "pkill ${signal} -f '${pattern}'"
+        case $? in
+            0)   echo "  [$name] [$pattern] signal sent" ;;
+            1)   echo "  [$name] [$pattern] not running" ;;
+            255) echo "  [$name] [$pattern] SSH connection failed" ;;
+            *)   echo "  [$name] [$pattern] pkill error (rc=$?)" ;;
+        esac
+    done
+
+    sleep 2
+
+    local all_stopped=true
+    echo "  [$name] verifying..."
+    for pattern in "$@"; do
+        local result
+        result=$(run_cmd "$user" "$addr" "pgrep -af '${pattern}' 2>/dev/null | grep -v 'pgrep -af'")
+        if [ -z "$result" ]; then
+            echo "  [$name]   $pattern: stopped"
+        else
+            local count
+            count=$(echo "$result" | wc -l | tr -d ' ')
+            echo "  [$name]   $pattern: still running ($count process(es))"
+            all_stopped=false
+        fi
+    done
+    [ "$all_stopped" = true ]
 }
 
 generate_session_id() {
@@ -163,34 +193,57 @@ stop_logging() {
         return 0
     }
 
-    # Phase 1: kill children first (iperf3, gpspipe, atinout).
-    # bash scripts are blocked in wait() for these children; killing children
-    # unblocks bash so it can receive signals in phase 2.
-    echo "Phase 1: killing child processes (iperf3, gpspipe, atinout)..."
+    # Step 1: SIGTERM the bash scripts and helpers only — NOT iperf3.
+    # iperf3 may be in uninterruptible kernel sleep (D-state) during an active
+    # network burst; sending any signal while in D-state has no effect. Let it
+    # finish its current burst first. Without the scripts running, iperf3 will
+    # not be restarted after its burst ends.
+    echo "Step 1: stopping scripts and helper processes (leaving iperf3 to finish its burst)..."
+    local step1_clean=true
     for entry in "${NODES[@]}"; do
         local name=$(get_node_name "$entry")
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
-        run_cmd "$user" "$addr" "pkill -9 -f iperf3; pkill -9 -f gpspipe; pkill -9 -f atinout; true"
-        echo "  [$name] done."
+        kill_procs "" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh gpspipe atinout || step1_clean=false
     done
 
-    sleep 2
+    if [ "$step1_clean" = true ]; then
+        echo "All processes stopped cleanly after step 1, skipping steps 2-4."
+    else
+        # Step 2: Wait for iperf3 to finish its current burst naturally. The burst
+        # duration is 10s so 15s gives a comfortable margin.
+        echo "Step 2: waiting 15s for iperf3 to finish its current burst..."
+        sleep 15
 
-    # Phase 2: now kill the parent bash scripts (now unblocked from wait())
-    echo "Phase 2: killing parent scripts (logsignalstrength, throughput_test)..."
-    for entry in "${NODES[@]}"; do
-        local name=$(get_node_name "$entry")
-        local user=$(get_node_user "$entry")
-        local addr=$(get_node_addr "$entry")
-        run_cmd "$user" "$addr" "pkill -9 -f logsignalstrength.sh; pkill -9 -f throughput_test.sh; true"
-        echo "  [$name] done."
-    done
+        # Step 3: SIGTERM everything still running. iperf3 is now between bursts
+        # (no longer in D-state), so SIGTERM will be effective. Bash scripts that
+        # deferred their earlier SIGTERM are also caught here.
+        echo "Step 3: sending SIGTERM to all remaining processes..."
+        local step3_clean=true
+        for entry in "${NODES[@]}"; do
+            local name=$(get_node_name "$entry")
+            local user=$(get_node_user "$entry")
+            local addr=$(get_node_addr "$entry")
+            kill_procs "" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh iperf3 gpspipe atinout || step3_clean=false
+        done
 
-    sleep 2
+        if [ "$step3_clean" = false ]; then
+            # Step 4: SIGTERM did not clear all processes — wait 5s more then SIGKILL.
+            echo "Step 4: waiting 5s then sending SIGKILL to remaining processes..."
+            sleep 5
+            for entry in "${NODES[@]}"; do
+                local name=$(get_node_name "$entry")
+                local user=$(get_node_user "$entry")
+                local addr=$(get_node_addr "$entry")
+                kill_procs "-9" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh iperf3 gpspipe atinout
+            done
+        else
+            echo "All processes stopped cleanly after step 3, skipping SIGKILL."
+        fi
+    fi
 
-    # Verify
-    echo "Verifying..."
+    # Final verification: all CellSweep processes must be gone.
+    echo "Verifying all processes have stopped..."
     local all_clean=true
     for entry in "${NODES[@]}"; do
         local name=$(get_node_name "$entry")
@@ -203,12 +256,12 @@ stop_logging() {
         if [ -n "$procs" ]; then
             local count
             count=$(echo "$procs" | wc -l | tr -d ' ')
-            echo "[$name] ERROR: $count process(es) still alive after SIGKILL:"
-            echo "$procs" | sed "s/^/  [$name] /"
-            echo "[$name] These may be in uninterruptible D-state. Reboot the node to clear."
+            echo "  [$name] ERROR: $count process(es) still alive:"
+            echo "$procs" | sed "s/^/    [$name] /"
+            echo "  [$name] These may be in uninterruptible D-state. Reboot the node to clear."
             all_clean=false
         else
-            echo "[$name] All processes stopped cleanly."
+            echo "  [$name] All processes stopped cleanly."
         fi
     done
 
