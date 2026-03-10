@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
 
-# Usage: ./throughput_test.sh <download|upload> <server> <duration> [port]
+# Usage: ./throughput_test.sh <download|upload> <server> <duration> [port] [interval]
 
 DIRECTION=$1
 SERVER=$2
 DURATION=${3:-10}
 PORT=${4:-5201}
+INTERVAL=${5:-1}
 
 IPERF_BIN="/usr/local/iperf3/src/iperf3"
 
-# Dependencies: iperf3, jq
+# Dependencies: iperf3, jq, gpspipe
 if [ ! -x "$IPERF_BIN" ] && ! command -v iperf3 >/dev/null 2>&1; then
     echo "Error: iperf3 not found at $IPERF_BIN or in PATH." >&2
+    exit 1
+fi
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq is not installed." >&2
+    exit 1
+fi
+if ! command -v gpspipe >/dev/null 2>&1; then
+    echo "Error: gpspipe is not installed." >&2
     exit 1
 fi
 
@@ -24,33 +33,36 @@ if ! date +%N | grep -E '^[0-9]+$' >/dev/null 2>&1; then
 fi
 
 IPERF_FLAGS="-J -t $DURATION -p $PORT"
-[ "$DIRECTION" == "upload" ] && IPERF_FLAGS="$IPERF_FLAGS" # default is upload (sender to receiver)
-[ "$DIRECTION" == "download" ] && IPERF_FLAGS="$IPERF_FLAGS -R" # reverse mode for download
+[ "$DIRECTION" == "download" ] && IPERF_FLAGS="$IPERF_FLAGS -R"
 
-echo "timestamp,direction,bitrate_bps"
+echo "timestamp,lat,lon,direction,bitrate_bps"
 
 while true; do
-    # Time before test
+    # Timestamp at start of burst
     if [ "$HAS_NANOSECONDS" = true ]; then
         timestamp=$(($(date +%s%N)/1000000))
     else
         timestamp=$(($(date +%s)*1000))
     fi
-    
-    # Run iperf3 and capture JSON
+
+    # GPS fix at start of burst
+    lat_lon=$(timeout 0.5s gpspipe -w -n 10 2>/dev/null | grep TPV | grep -om1 "[-]\?[[:digit:]]\{1,3\}\.[[:digit:]]\+" | tr '\n' ',')
+    [ -z "$lat_lon" ] && lat_lon=","
+
+    # Run iperf3 burst
     result=$($IPERF_BIN -c "$SERVER" $IPERF_FLAGS 2>/dev/null)
-    
+
     if [ $? -eq 0 ]; then
         if [ "$DIRECTION" == "download" ]; then
-            bitrate=$(echo "$result" | jq '.end.sum_received.bits_per_second')
+            bitrate=$(echo "$result" | jq '.end.sum_received.bits_per_second // 0')
         else
-            bitrate=$(echo "$result" | jq '.end.sum_sent.bits_per_second')
+            bitrate=$(echo "$result" | jq '.end.sum_sent.bits_per_second // 0')
         fi
-        
-        echo "${timestamp},${DIRECTION},${bitrate}"
     else
-        echo "${timestamp},${DIRECTION},0"
+        bitrate=0
     fi
-    
-    sleep 1
+
+    echo "${timestamp},${lat_lon}${DIRECTION},${bitrate}"
+
+    sleep "$INTERVAL"
 done
