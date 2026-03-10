@@ -15,7 +15,25 @@ fi
 REMOTE_SIGNAL_SCRIPT="${REMOTE_REPO_ROOT}/testnodes/logsignalstrength.sh"
 REMOTE_THROUGHPUT_SCRIPT="${REMOTE_REPO_ROOT}/testnodes/throughput_test.sh"
 
+# Parse Ports
+# Default to 5201 if not set. If "5201,5202", split them.
+PORT_DOWN=$(echo "${IPERF_PORTS:-5201}" | cut -d',' -f1)
+PORT_UP=$(echo "${IPERF_PORTS:-5201}" | cut -d',' -f2)
+# If only one port provided, both use the same
+[ -z "$PORT_UP" ] && PORT_UP=$PORT_DOWN
+
 # --- Helper Functions ---
+
+run_cmd() {
+    local node_user=$1
+    local addr=$2
+    local cmd=$3
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "[DRY-RUN] ssh ${node_user}@${addr} '$cmd'" >&2
+    else
+        ssh "${node_user}@${addr}" "$cmd"
+    fi
+}
 
 get_node_name() { echo "${1%%|*}"; }
 get_node_ip()   { local tmp="${1#*|}"; echo "${tmp%%|*}"; }
@@ -25,6 +43,7 @@ get_node_addr() {
     local entry=$1
     local name=$(get_node_name "$entry")
     local ip=$(get_node_ip "$entry")
+    if [ "$DRY_RUN" = "true" ]; then echo "$name"; return; fi
     ping -c 1 -W 1 "$name" >/dev/null 2>&1 && echo "$name" || echo "$ip"
 }
 
@@ -50,32 +69,32 @@ prepare_server() {
         exit 1
     fi
 
+    # Unique ports to authorize
+    local unique_ports=$(echo "$PORT_DOWN $PORT_UP" | tr ' ' '\n' | sort -u)
+
     for entry in "${NODES[@]}"; do
         local name=$(get_node_name "$entry")
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
         
         echo "[$name] Fetching public IP..."
-        local public_ip=$(ssh "${user}@${addr}" "curl -s https://ifconfig.me")
+        local public_ip=$(run_cmd "$user" "$addr" "curl -s https://ifconfig.me")
+        [ "$DRY_RUN" = "true" ] && public_ip="1.2.3.4"
         
         if [[ $public_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "[$name] Public IP is $public_ip. Authorizing in AWS SG $AWS_SECURITY_GROUP_ID..."
-            
-            # Authorize TCP
-            aws ec2 authorize-security-group-ingress \
-                --group-id "$AWS_SECURITY_GROUP_ID" \
-                --protocol tcp \
-                --port "${IPERF_PORTS:-5201}" \
-                --cidr "${public_ip}/32" \
-                --region "$AWS_REGION" 2>/dev/null || echo "[$name] Port already authorized or AWS CLI error."
-            
-            # Authorize UDP (optional but good for iperf3)
-            aws ec2 authorize-security-group-ingress \
-                --group-id "$AWS_SECURITY_GROUP_ID" \
-                --protocol udp \
-                --port "${IPERF_PORTS:-5201}" \
-                --cidr "${public_ip}/32" \
-                --region "$AWS_REGION" 2>/dev/null
+            for p in $unique_ports; do
+                echo "[$name] Authorizing port $p for $public_ip in AWS SG $AWS_SECURITY_GROUP_ID..."
+                local cmd_tcp="aws ec2 authorize-security-group-ingress --group-id \"$AWS_SECURITY_GROUP_ID\" --protocol tcp --port \"$p\" --cidr \"${public_ip}/32\" --region \"$AWS_REGION\""
+                local cmd_udp="aws ec2 authorize-security-group-ingress --group-id \"$AWS_SECURITY_GROUP_ID\" --protocol udp --port \"$p\" --cidr \"${public_ip}/32\" --region \"$AWS_REGION\""
+
+                if [ "$DRY_RUN" = "true" ]; then
+                    echo "[DRY-RUN] $cmd_tcp"
+                    echo "[DRY-RUN] $cmd_udp"
+                else
+                    eval "$cmd_tcp" 2>/dev/null || echo "[$name] Port $p TCP already authorized or error."
+                    eval "$cmd_udp" 2>/dev/null || echo "[$name] Port $p UDP already authorized or error."
+                fi
+            done
         else
             echo "[$name] Error: Could not fetch valid public IP ($public_ip)."
         fi
@@ -93,21 +112,19 @@ start_logging() {
         local name=$(get_node_name "$entry")
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
-        local remote_dir="${REMOTE_BASE_DATADIR}/${session_id}"
-        
-        echo "[$name] Initializing at ${user}@${addr}..."
-        ssh "${user}@${addr}" "mkdir -p \"$remote_dir\""
-        
-        # 1. Start Signal Strength Logging
-        ssh "${user}@${addr}" "nohup $REMOTE_SIGNAL_SCRIPT > \"$remote_dir/signal_${name}.csv\" 2>&1 &"
-        
+        local remote_dir=${REMOTE_BASE_DATADIR}/${session_id}
+        local log_file=${remote_dir}/sweep_${name}.csv
+
+        echo "[$name] Starting at ${user}@${addr}..."
+        run_cmd "$user" "$addr" "mkdir -p $remote_dir && nohup $REMOTE_SCRIPT > $remote_dir/signal_${name}.csv 2>&1 &"
+
         # 2. Start Throughput Testing if role is assigned
         if [ "$name" == "$DOWNLINK_NODE" ]; then
-            echo "[$name] Starting DOWNLINK tests against $IPERF_SERVER..."
-            ssh "${user}@${addr}" "nohup $REMOTE_THROUGHPUT_SCRIPT download $IPERF_SERVER $BURST_DURATION > \"$remote_dir/throughput_down_${name}.csv\" 2>&1 &"
+            echo "[$name] Starting DOWNLINK tests against $IPERF_SERVER on port $PORT_DOWN..."
+            run_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT download $IPERF_SERVER $BURST_DURATION $PORT_DOWN > $remote_dir/throughput_down_${name}.csv 2>&1 &"
         elif [ "$name" == "$UPLINK_NODE" ]; then
-            echo "[$name] Starting UPLINK tests against $IPERF_SERVER..."
-            ssh "${user}@${addr}" "nohup $REMOTE_THROUGHPUT_SCRIPT upload $IPERF_SERVER $BURST_DURATION > \"$remote_dir/throughput_up_${name}.csv\" 2>&1 &"
+            echo "[$name] Starting UPLINK tests against $IPERF_SERVER on port $PORT_UP..."
+            run_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT upload $IPERF_SERVER $BURST_DURATION $PORT_UP > $remote_dir/throughput_up_${name}.csv 2>&1 &"
         fi
     done
     echo "$session_id" > "$(dirname "$0")/.current_session"
@@ -119,7 +136,7 @@ stop_logging() {
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
         echo "[$name] Stopping all CellSweep processes..."
-        ssh "${user}@${addr}" "pkill -f logsignalstrength.sh; pkill -f throughput_test.sh; pkill -f iperf3"
+        run_cmd "$user" "$addr" "pkill -f logsignalstrength.sh; pkill -f throughput_test.sh; pkill -f iperf3; pkill -f /usr/local/iperf3/src/iperf3"
     done
 }
 
@@ -128,9 +145,10 @@ check_status() {
         local name=$(get_node_name "$entry")
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
-        local sig_pid=$(ssh "${user}@${addr}" "pgrep -f logsignalstrength.sh")
-        local thr_pid=$(ssh "${user}@${addr}" "pgrep -f throughput_test.sh")
-        printf "[%-10s] Signal: %-15s Throughput: %s\n" "$name" "${sig_pid:+RUNNING ($sig_pid)}${sig_pid:-STOPPED}" "${thr_pid:+RUNNING ($thr_pid)}${thr_pid:-STOPPED}"
+        local sig_pid=$(run_cmd "$user" "$addr" "pgrep -f logsignalstrength.sh")
+        local thr_pid=$(run_cmd "$user" "$addr" "pgrep -f throughput_test.sh")
+        # In dry run, these will be empty strings because run_cmd redirects to stderr
+        printf "[%-10s] Signal: %-15s Throughput: %s\n" "$name" "${sig_pid:+RUNNING ($sig_pid)}${sig_pid:-STATUS_UNKNOWN}" "${thr_pid:+RUNNING ($thr_pid)}${thr_pid:-STATUS_UNKNOWN}"
     done
 }
 
@@ -143,12 +161,19 @@ fetch_logs() {
             local name=$(get_node_name "$entry")
             local user=$(get_node_user "$entry")
             local addr=$(get_node_addr "$entry")
+            
+            # List remote sessions for today
             local remote_sessions=$(ssh "${user}@${addr}" "ls -1 $REMOTE_BASE_DATADIR 2>/dev/null | grep '^${date_filter}_'")
+            
             for s_id in $remote_sessions; do
                 local local_dir="${LOCAL_BASE_DATADIR}/${s_id}"
                 mkdir -p "$local_dir"
                 echo "[$name] Syncing session $s_id..."
-                rsync -az "${user}@${addr}:${REMOTE_BASE_DATADIR}/${s_id}/" "$local_dir/"
+                if [ "$DRY_RUN" = "true" ]; then
+                    echo "[DRY-RUN] rsync -az \"${user}@${addr}:${REMOTE_BASE_DATADIR}/${s_id}/\" \"$local_dir/\""
+                else
+                    rsync -az "${user}@${addr}:${REMOTE_BASE_DATADIR}/${s_id}/" "$local_dir/"
+                fi
             done
         done
     else
@@ -159,7 +184,11 @@ fetch_logs() {
             local local_dir="${LOCAL_BASE_DATADIR}/${target_session}"
             mkdir -p "$local_dir"
             echo "[$name] Fetching $target_session..."
-            scp -r "${user}@${addr}:${REMOTE_BASE_DATADIR}/${target_session}/*" "$local_dir/" 2>/dev/null
+            if [ "$DRY_RUN" = "true" ]; then
+                echo "[DRY-RUN] scp -r \"${user}@${addr}:${REMOTE_BASE_DATADIR}/${target_session}/*\" \"$local_dir/\""
+            else
+                scp -r "${user}@${addr}:${REMOTE_BASE_DATADIR}/${target_session}/*" "$local_dir/" 2>/dev/null
+            fi
         done
     fi
 }
