@@ -35,17 +35,19 @@ run_cmd() {
     fi
 }
 
-# Fire-and-forget: closes SSH stdin (-n), backgrounds the command, and disowns
-# it so the remote shell exits cleanly without waiting for children.
-# Pass commands WITHOUT a trailing &; this function adds "& disown".
+# Fire-and-forget: runs cmd in a background subshell whose stdin/stdout/stderr
+# are redirected away from the SSH pipe before the subshell starts. This means
+# sshd sees zero pipe references when the SSH shell exits and returns promptly.
+# Inner redirections inside $cmd (e.g. >/log 2>&1 </dev/null) still apply
+# correctly to the nohup'd process and override the outer /dev/null for it.
 run_bg_cmd() {
     local node_user=$1
     local addr=$2
     local cmd=$3
     if [ "$DRY_RUN" = "true" ]; then
-        echo "[DRY-RUN] ssh -n ${node_user}@${addr} '$cmd & disown'" >&2
+        echo "[DRY-RUN] ssh -n ${node_user}@${addr} '{ $cmd; } </dev/null &>/dev/null &'" >&2
     else
-        ssh -n "${node_user}@${addr}" "$cmd & disown"
+        ssh -n "${node_user}@${addr}" "{ $cmd; } </dev/null &>/dev/null &"
     fi
 }
 
