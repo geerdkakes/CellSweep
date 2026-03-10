@@ -136,7 +136,7 @@ stop_logging() {
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
         echo "[$name] Stopping all CellSweep processes..."
-        run_cmd "$user" "$addr" "pkill -f logsignalstrength.sh; pkill -f throughput_test.sh; pkill -f iperf3; pkill -f /usr/local/iperf3/src/iperf3"
+        run_cmd "$user" "$addr" "pkill -f logsignalstrength.sh; pkill -f throughput_test.sh; pkill -f iperf3; pkill -f gpspipe; pkill -f atinout"
     done
 }
 

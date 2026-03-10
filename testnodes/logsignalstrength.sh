@@ -6,7 +6,7 @@ if [ "${BASH_VERSINFO:-0}" -lt 3 ] || ([ "${BASH_VERSINFO:-0}" -eq 3 ] && [ "${B
     exit 1
 fi
 
-REQUIRED_TOOLS=("awk" "atinout" "gpspipe" "grep" "date")
+REQUIRED_TOOLS=("awk" "atinout" "gpspipe" "grep" "date" "timeout")
 for tool in "${REQUIRED_TOOLS[@]}"; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "Error: Required tool '$tool' is not installed." >&2
@@ -20,14 +20,8 @@ if ! date +%N | grep -E '^[0-9]+$' >/dev/null; then
 fi
 
 # --- Configuration ---
-
-# Load local config if it exists
 CONFIG_FILE="$(dirname "$0")/config.env"
-if [ -f "$CONFIG_FILE" ]; then
-    source "$CONFIG_FILE"
-fi
-
-# Default modem port
+[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 MODEM_PORT=${MODEM_PORT:-/dev/ttyUSB2}
 
 # Define the AWK processor logic
@@ -52,7 +46,6 @@ function handle_nsa(ts, gps, f) {
 EOF
 
 # --- Main Loop ---
-
 echo "timestamp,lat,lon,cell_type,state,technology,duplex_mode,mcc,mnc,cellid,pcid,tac,arfcn,band,ns_dl_bw,rsrp,rsrq,sinr,scs,srxlev"
 
 LAST_GPS_WARN=0
@@ -64,14 +57,13 @@ while true; do
       timestamp=$(($(date +%s)*1000))
   fi
   
-  # lat lon position from gps (robust regex for variable precision)
-  # We use a smaller -n value to avoid blocking the signal logging too long if GPS is slow
-  lat_lon=$(gpspipe -w -n 5 2>/dev/null | grep TPV | grep -om1 "[-]\?[[:digit:]]\{1,3\}\.[[:digit:]]\+" | tr '\n' ',')
+  # Fetch GPS with a hard timeout to prevent hanging the loop
+  # We look for TPV messages and grab lat/lon. 
+  # Using 'timeout' ensures that if gpspipe doesn't see data, we move on in 0.5s.
+  lat_lon=$(timeout 0.5s gpspipe -w -n 10 2>/dev/null | grep TPV | grep -om1 "[-]\?[[:digit:]]\{1,3\}\.[[:digit:]]\+" | tr '\n' ',')
   
-  # maintain CSV column alignment if GPS is unavailable
   if [ -z "$lat_lon" ]; then
       lat_lon=","
-      # Rate-limited warning to stderr (every 10s)
       now=$(date +%s)
       if [ $((now - LAST_GPS_WARN)) -ge 10 ]; then
           echo "Warning: No GPS fix at $(date)" >&2
@@ -79,12 +71,13 @@ while true; do
       fi
   fi
 
-  # query modem
+  # query modem - non-blocking
   modem_output=$(echo 'AT+QENG="servingcell"' | atinout - "$MODEM_PORT" - 2>/dev/null | grep '+QENG:')
   
   if [ -n "$modem_output" ]; then
       echo "$modem_output" | awk -v ts="$timestamp" -v gps="$lat_lon" "$PARSE_MODEM_DATA"
   fi
 
-  sleep 0.1
+  # Sleep slightly longer to give the CPU/IO a breath
+  sleep 0.2
 done
