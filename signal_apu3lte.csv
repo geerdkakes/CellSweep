@@ -1,0 +1,3 @@
+timestamp,lat,lon,cell_type,state,technology,duplex_mode,mcc,mnc,cellid,pcid,tac,arfcn,band,ns_dl_bw,rsrp,rsrq,sinr,scs,srxlev
+Warning: No GPS fix at Tue Mar 10 01:21:43 CET 2026
+1773102102361,,"servingcell","NSA","NR5G-NSA",,204,08,,541,,432030,1,3,-103,-10,7,0,
