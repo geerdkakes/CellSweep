@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 
-# Usage: ./throughput_test.sh <download|upload> <server> <duration> [port] [interval]
+# Usage: ./throughput_test.sh <download|upload> <server> <duration> [port] [interval] [json_log]
 
 DIRECTION=$1
 SERVER=$2
 DURATION=${3:-10}
 PORT=${4:-5201}
 INTERVAL=${5:-1}
+JSON_LOG=${6:-}
 
 IPERF_BIN="/usr/local/iperf3/src/iperf3"
 
@@ -57,6 +58,10 @@ while true; do
             bitrate=$(echo "$result" | jq '.end.sum_received.bits_per_second // 0')
         else
             bitrate=$(echo "$result" | jq '.end.sum_sent.bits_per_second // 0')
+        fi
+        # Append compact JSON with timestamp and direction added for correlation
+        if [ -n "$JSON_LOG" ]; then
+            echo "$result" | jq -c ". + {burst_timestamp: $timestamp, direction: \"$DIRECTION\"}" >> "$JSON_LOG"
         fi
     else
         bitrate=0

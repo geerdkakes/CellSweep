@@ -137,10 +137,10 @@ start_logging() {
         # 2. Start Throughput Testing if role is assigned
         if [ "$name" == "$DOWNLINK_NODE" ]; then
             echo "[$name] Starting DOWNLINK tests against $IPERF_SERVER on port $PORT_DOWN..."
-            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT download $IPERF_SERVER $BURST_DURATION $PORT_DOWN ${BURST_INTERVAL:-1} > $remote_dir/throughput_down_${name}.csv 2>&1 < /dev/null"
+            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT download $IPERF_SERVER $BURST_DURATION $PORT_DOWN ${BURST_INTERVAL:-1} $remote_dir/throughput_down_${name}.jsonl > $remote_dir/throughput_down_${name}.csv 2>&1 < /dev/null"
         elif [ "$name" == "$UPLINK_NODE" ]; then
             echo "[$name] Starting UPLINK tests against $IPERF_SERVER on port $PORT_UP..."
-            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT upload $IPERF_SERVER $BURST_DURATION $PORT_UP ${BURST_INTERVAL:-1} > $remote_dir/throughput_up_${name}.csv 2>&1 < /dev/null"
+            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT upload $IPERF_SERVER $BURST_DURATION $PORT_UP ${BURST_INTERVAL:-1} $remote_dir/throughput_up_${name}.jsonl > $remote_dir/throughput_up_${name}.csv 2>&1 < /dev/null"
         fi
     done
     echo "$session_id" > "$(dirname "$0")/.current_session"
