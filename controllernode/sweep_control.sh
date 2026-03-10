@@ -146,14 +146,53 @@ start_logging() {
     echo "$session_id" > "$(dirname "$0")/.current_session"
 }
 
+STOP_PATTERN="logsignalstrength|throughput_test|iperf3|gpspipe|atinout"
+
 stop_logging() {
+    # Send SIGTERM to all CellSweep processes on every node
     for entry in "${NODES[@]}"; do
         local name=$(get_node_name "$entry")
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
-        echo "[$name] Stopping all CellSweep processes..."
-        run_cmd "$user" "$addr" "pkill -f logsignalstrength.sh; pkill -f throughput_test.sh; pkill -f iperf3; pkill -f gpspipe; pkill -f atinout"
+        echo "[$name] Sending stop signal..."
+        run_cmd "$user" "$addr" "pkill -f logsignalstrength.sh; pkill -f throughput_test.sh; pkill -f iperf3; pkill -f gpspipe; pkill -f atinout; true"
     done
+
+    [ "$DRY_RUN" = "true" ] && return 0
+
+    # Wait for processes to terminate gracefully
+    echo "Waiting 3s for processes to exit..."
+    sleep 3
+
+    # Verify and force-kill any survivors
+    local all_clean=true
+    for entry in "${NODES[@]}"; do
+        local name=$(get_node_name "$entry")
+        local user=$(get_node_user "$entry")
+        local addr=$(get_node_addr "$entry")
+
+        local remaining
+        remaining=$(run_cmd "$user" "$addr" "pgrep -cf '$STOP_PATTERN' 2>/dev/null || echo 0")
+        remaining="${remaining//[^0-9]/}"  # strip any whitespace
+
+        if [ "${remaining:-0}" -gt 0 ]; then
+            echo "[$name] WARNING: $remaining process(es) still running — sending SIGKILL..."
+            run_cmd "$user" "$addr" "pkill -9 -f logsignalstrength.sh; pkill -9 -f throughput_test.sh; pkill -9 -f iperf3; pkill -9 -f gpspipe; pkill -9 -f atinout; true"
+            sleep 1
+            remaining=$(run_cmd "$user" "$addr" "pgrep -cf '$STOP_PATTERN' 2>/dev/null || echo 0")
+            remaining="${remaining//[^0-9]/}"
+            if [ "${remaining:-0}" -gt 0 ]; then
+                echo "[$name] ERROR: $remaining process(es) could not be killed. Manual intervention required."
+                all_clean=false
+            else
+                echo "[$name] All processes killed (required SIGKILL)."
+            fi
+        else
+            echo "[$name] All processes stopped cleanly."
+        fi
+    done
+
+    [ "$all_clean" = false ] && return 1 || return 0
 }
 
 check_status() {
