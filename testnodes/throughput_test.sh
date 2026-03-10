@@ -18,6 +18,11 @@ fi
 # Use the specific binary if it exists, otherwise fallback to PATH
 [ -x "$IPERF_BIN" ] || IPERF_BIN="iperf3"
 
+HAS_NANOSECONDS=true
+if ! date +%N | grep -E '^[0-9]+$' >/dev/null 2>&1; then
+    HAS_NANOSECONDS=false
+fi
+
 IPERF_FLAGS="-J -t $DURATION -p $PORT"
 [ "$DIRECTION" == "upload" ] && IPERF_FLAGS="$IPERF_FLAGS" # default is upload (sender to receiver)
 [ "$DIRECTION" == "download" ] && IPERF_FLAGS="$IPERF_FLAGS -R" # reverse mode for download
@@ -26,7 +31,11 @@ echo "timestamp,direction,bitrate_bps"
 
 while true; do
     # Time before test
-    timestamp=$(($(date +%s%N)/1000000))
+    if [ "$HAS_NANOSECONDS" = true ]; then
+        timestamp=$(($(date +%s%N)/1000000))
+    else
+        timestamp=$(($(date +%s)*1000))
+    fi
     
     # Run iperf3 and capture JSON
     result=$($IPERF_BIN -c "$SERVER" $IPERF_FLAGS 2>/dev/null)

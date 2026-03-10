@@ -35,6 +35,19 @@ run_cmd() {
     fi
 }
 
+# Fire-and-forget: closes SSH stdin (-n) and appends disown so background
+# processes are fully detached before the remote shell exits.
+run_bg_cmd() {
+    local node_user=$1
+    local addr=$2
+    local cmd=$3
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "[DRY-RUN] ssh -n ${node_user}@${addr} '$cmd; disown'" >&2
+    else
+        ssh -n "${node_user}@${addr}" "$cmd; disown"
+    fi
+}
+
 get_node_name() { echo "${1%%|*}"; }
 get_node_ip()   { local tmp="${1#*|}"; echo "${tmp%%|*}"; }
 get_node_user() { echo "${1##*|}"; }
@@ -116,15 +129,15 @@ start_logging() {
         local log_file=${remote_dir}/sweep_${name}.csv
 
         echo "[$name] Starting at ${user}@${addr}..."
-        run_cmd "$user" "$addr" "mkdir -p $remote_dir && nohup $REMOTE_SIGNAL_SCRIPT > $remote_dir/signal_${name}.csv 2>&1 < /dev/null &"
+        run_bg_cmd "$user" "$addr" "mkdir -p $remote_dir && nohup $REMOTE_SIGNAL_SCRIPT > $remote_dir/signal_${name}.csv 2>&1 < /dev/null &"
 
         # 2. Start Throughput Testing if role is assigned
         if [ "$name" == "$DOWNLINK_NODE" ]; then
             echo "[$name] Starting DOWNLINK tests against $IPERF_SERVER on port $PORT_DOWN..."
-            run_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT download $IPERF_SERVER $BURST_DURATION $PORT_DOWN > $remote_dir/throughput_down_${name}.csv 2>&1 < /dev/null &"
+            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT download $IPERF_SERVER $BURST_DURATION $PORT_DOWN > $remote_dir/throughput_down_${name}.csv 2>&1 < /dev/null &"
         elif [ "$name" == "$UPLINK_NODE" ]; then
             echo "[$name] Starting UPLINK tests against $IPERF_SERVER on port $PORT_UP..."
-            run_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT upload $IPERF_SERVER $BURST_DURATION $PORT_UP > $remote_dir/throughput_up_${name}.csv 2>&1 < /dev/null &"
+            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT upload $IPERF_SERVER $BURST_DURATION $PORT_UP > $remote_dir/throughput_up_${name}.csv 2>&1 < /dev/null &"
         fi
     done
     echo "$session_id" > "$(dirname "$0")/.current_session"
@@ -163,13 +176,17 @@ fetch_logs() {
             local addr=$(get_node_addr "$entry")
             
             # List remote sessions for today
-            local remote_sessions=$(ssh "${user}@${addr}" "ls -1 $REMOTE_BASE_DATADIR 2>/dev/null | grep '^${date_filter}_'")
+            local remote_sessions=$(run_cmd "$user" "$addr" "ls -1 $REMOTE_BASE_DATADIR 2>/dev/null | grep '^${date_filter}_'")
             
             for s_id in $remote_sessions; do
                 local local_dir="${LOCAL_BASE_DATADIR}/${s_id}"
                 mkdir -p "$local_dir"
                 echo "[$name] Fetching session $s_id..."
-                scp -r "${user}@${addr}:${REMOTE_BASE_DATADIR}/${s_id}/*" "$local_dir/" 2>/dev/null
+                if [ "$DRY_RUN" = "true" ]; then
+                    echo "[DRY-RUN] rsync -az ${user}@${addr}:${REMOTE_BASE_DATADIR}/${s_id}/ $local_dir/" >&2
+                else
+                    rsync -az "${user}@${addr}:${REMOTE_BASE_DATADIR}/${s_id}/" "$local_dir/"
+                fi
             done
         done
     else
@@ -180,7 +197,11 @@ fetch_logs() {
             local local_dir="${LOCAL_BASE_DATADIR}/${target_session}"
             mkdir -p "$local_dir"
             echo "[$name] Fetching $target_session..."
-            scp -r "${user}@${addr}:${REMOTE_BASE_DATADIR}/${target_session}/*" "$local_dir/" 2>/dev/null
+            if [ "$DRY_RUN" = "true" ]; then
+                echo "[DRY-RUN] rsync -az ${user}@${addr}:${REMOTE_BASE_DATADIR}/${target_session}/ $local_dir/" >&2
+            else
+                rsync -az "${user}@${addr}:${REMOTE_BASE_DATADIR}/${target_session}/" "$local_dir/"
+            fi
         done
     fi
 }
