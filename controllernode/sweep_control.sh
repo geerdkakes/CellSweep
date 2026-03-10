@@ -171,18 +171,22 @@ stop_logging() {
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
 
-        local remaining
-        remaining=$(run_cmd "$user" "$addr" "pgrep -cf '$STOP_PATTERN' 2>/dev/null || echo 0")
-        remaining="${remaining//[^0-9]/}"  # strip any whitespace
+        local procs
+        procs=$(run_cmd "$user" "$addr" "pgrep -af '$STOP_PATTERN' 2>/dev/null")
 
-        if [ "${remaining:-0}" -gt 0 ]; then
-            echo "[$name] WARNING: $remaining process(es) still running — sending SIGKILL..."
+        if [ -n "$procs" ]; then
+            local count
+            count=$(echo "$procs" | wc -l | tr -d ' ')
+            echo "[$name] WARNING: $count process(es) still running — sending SIGKILL..."
+            echo "$procs" | sed "s/^/  [$name] /"
             run_cmd "$user" "$addr" "pkill -9 -f logsignalstrength.sh; pkill -9 -f throughput_test.sh; pkill -9 -f iperf3; pkill -9 -f gpspipe; pkill -9 -f atinout; true"
-            sleep 1
-            remaining=$(run_cmd "$user" "$addr" "pgrep -cf '$STOP_PATTERN' 2>/dev/null || echo 0")
-            remaining="${remaining//[^0-9]/}"
-            if [ "${remaining:-0}" -gt 0 ]; then
-                echo "[$name] ERROR: $remaining process(es) could not be killed. Manual intervention required."
+            sleep 2
+            procs=$(run_cmd "$user" "$addr" "pgrep -af '$STOP_PATTERN' 2>/dev/null")
+            if [ -n "$procs" ]; then
+                count=$(echo "$procs" | wc -l | tr -d ' ')
+                echo "[$name] ERROR: $count process(es) survived SIGKILL (likely D-state I/O wait):"
+                echo "$procs" | sed "s/^/  [$name] /"
+                echo "[$name] These will clear when I/O completes. Reboot the node to force-clear."
                 all_clean=false
             else
                 echo "[$name] All processes killed (required SIGKILL)."
