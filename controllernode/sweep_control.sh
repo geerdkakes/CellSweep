@@ -35,16 +35,17 @@ run_cmd() {
     fi
 }
 
-# Fire-and-forget: closes SSH stdin (-n) and appends disown so background
-# processes are fully detached before the remote shell exits.
+# Fire-and-forget: closes SSH stdin (-n), backgrounds the command, and disowns
+# it so the remote shell exits cleanly without waiting for children.
+# Pass commands WITHOUT a trailing &; this function adds "& disown".
 run_bg_cmd() {
     local node_user=$1
     local addr=$2
     local cmd=$3
     if [ "$DRY_RUN" = "true" ]; then
-        echo "[DRY-RUN] ssh -n ${node_user}@${addr} '$cmd; disown'" >&2
+        echo "[DRY-RUN] ssh -n ${node_user}@${addr} '$cmd & disown'" >&2
     else
-        ssh -n "${node_user}@${addr}" "$cmd; disown"
+        ssh -n "${node_user}@${addr}" "$cmd & disown"
     fi
 }
 
@@ -129,15 +130,15 @@ start_logging() {
         local log_file=${remote_dir}/sweep_${name}.csv
 
         echo "[$name] Starting at ${user}@${addr}..."
-        run_bg_cmd "$user" "$addr" "mkdir -p $remote_dir && nohup $REMOTE_SIGNAL_SCRIPT > $remote_dir/signal_${name}.csv 2>&1 < /dev/null &"
+        run_bg_cmd "$user" "$addr" "mkdir -p $remote_dir && nohup $REMOTE_SIGNAL_SCRIPT > $remote_dir/signal_${name}.csv 2>&1 < /dev/null"
 
         # 2. Start Throughput Testing if role is assigned
         if [ "$name" == "$DOWNLINK_NODE" ]; then
             echo "[$name] Starting DOWNLINK tests against $IPERF_SERVER on port $PORT_DOWN..."
-            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT download $IPERF_SERVER $BURST_DURATION $PORT_DOWN > $remote_dir/throughput_down_${name}.csv 2>&1 < /dev/null &"
+            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT download $IPERF_SERVER $BURST_DURATION $PORT_DOWN > $remote_dir/throughput_down_${name}.csv 2>&1 < /dev/null"
         elif [ "$name" == "$UPLINK_NODE" ]; then
             echo "[$name] Starting UPLINK tests against $IPERF_SERVER on port $PORT_UP..."
-            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT upload $IPERF_SERVER $BURST_DURATION $PORT_UP > $remote_dir/throughput_up_${name}.csv 2>&1 < /dev/null &"
+            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT upload $IPERF_SERVER $BURST_DURATION $PORT_UP > $remote_dir/throughput_up_${name}.csv 2>&1 < /dev/null"
         fi
     done
     echo "$session_id" > "$(dirname "$0")/.current_session"
