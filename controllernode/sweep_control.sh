@@ -148,23 +148,49 @@ start_logging() {
 
 STOP_PATTERN="logsignalstrength|throughput_test|iperf3|gpspipe|atinout"
 
+check_procs() {
+    local user=$1 addr=$2
+    # Filter out the pgrep command itself (its cmdline contains the pattern string)
+    run_cmd "$user" "$addr" "pgrep -af '$STOP_PATTERN' 2>/dev/null | grep -v 'pgrep -af'"
+}
+
 stop_logging() {
-    # Send SIGTERM to all CellSweep processes on every node
+    [ "$DRY_RUN" = "true" ] && {
+        for entry in "${NODES[@]}"; do
+            local name=$(get_node_name "$entry") user=$(get_node_user "$entry") addr=$(get_node_addr "$entry")
+            echo "[DRY-RUN] Would stop all CellSweep processes on $name" >&2
+        done
+        return 0
+    }
+
+    # Phase 1: kill children first (iperf3, gpspipe, atinout).
+    # bash scripts are blocked in wait() for these children; killing children
+    # unblocks bash so it can receive signals in phase 2.
+    echo "Phase 1: killing child processes (iperf3, gpspipe, atinout)..."
     for entry in "${NODES[@]}"; do
         local name=$(get_node_name "$entry")
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
-        echo "[$name] Sending stop signal..."
-        run_cmd "$user" "$addr" "pkill -f logsignalstrength.sh; pkill -f throughput_test.sh; pkill -f iperf3; pkill -f gpspipe; pkill -f atinout; true"
+        run_cmd "$user" "$addr" "pkill -9 -f iperf3; pkill -9 -f gpspipe; pkill -9 -f atinout; true"
+        echo "  [$name] done."
     done
 
-    [ "$DRY_RUN" = "true" ] && return 0
+    sleep 2
 
-    # Wait for processes to terminate gracefully
-    echo "Waiting 3s for processes to exit..."
-    sleep 3
+    # Phase 2: now kill the parent bash scripts (now unblocked from wait())
+    echo "Phase 2: killing parent scripts (logsignalstrength, throughput_test)..."
+    for entry in "${NODES[@]}"; do
+        local name=$(get_node_name "$entry")
+        local user=$(get_node_user "$entry")
+        local addr=$(get_node_addr "$entry")
+        run_cmd "$user" "$addr" "pkill -9 -f logsignalstrength.sh; pkill -9 -f throughput_test.sh; true"
+        echo "  [$name] done."
+    done
 
-    # Verify and force-kill any survivors
+    sleep 2
+
+    # Verify
+    echo "Verifying..."
     local all_clean=true
     for entry in "${NODES[@]}"; do
         local name=$(get_node_name "$entry")
@@ -172,25 +198,15 @@ stop_logging() {
         local addr=$(get_node_addr "$entry")
 
         local procs
-        procs=$(run_cmd "$user" "$addr" "pgrep -af '$STOP_PATTERN' 2>/dev/null")
+        procs=$(check_procs "$user" "$addr")
 
         if [ -n "$procs" ]; then
             local count
             count=$(echo "$procs" | wc -l | tr -d ' ')
-            echo "[$name] WARNING: $count process(es) still running — sending SIGKILL..."
+            echo "[$name] ERROR: $count process(es) still alive after SIGKILL:"
             echo "$procs" | sed "s/^/  [$name] /"
-            run_cmd "$user" "$addr" "pkill -9 -f logsignalstrength.sh; pkill -9 -f throughput_test.sh; pkill -9 -f iperf3; pkill -9 -f gpspipe; pkill -9 -f atinout; true"
-            sleep 2
-            procs=$(run_cmd "$user" "$addr" "pgrep -af '$STOP_PATTERN' 2>/dev/null")
-            if [ -n "$procs" ]; then
-                count=$(echo "$procs" | wc -l | tr -d ' ')
-                echo "[$name] ERROR: $count process(es) survived SIGKILL (likely D-state I/O wait):"
-                echo "$procs" | sed "s/^/  [$name] /"
-                echo "[$name] These will clear when I/O completes. Reboot the node to force-clear."
-                all_clean=false
-            else
-                echo "[$name] All processes killed (required SIGKILL)."
-            fi
+            echo "[$name] These may be in uninterruptible D-state. Reboot the node to clear."
+            all_clean=false
         else
             echo "[$name] All processes stopped cleanly."
         fi
