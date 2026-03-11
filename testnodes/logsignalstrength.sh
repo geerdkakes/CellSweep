@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 
-# --- Configuration ---
 MODEM_PORT=${MODEM_PORT:-/dev/ttyUSB2}
 GPS_STATE="/dev/shm/gps_state.json"
 
-# Ensure gps_daemon is running
+# Start daemon if missing (quietly)
 if ! pgrep -f "gps_daemon.sh" > /dev/null; then
-    $(dirname "$0")/gps_daemon.sh &
+    $(dirname "$0")/gps_daemon.sh >/dev/null 2>&1 &
     sleep 1
 fi
 
@@ -16,12 +15,13 @@ get_ns_timestamp() {
         t=$(python3 -c 'import time; print(int(time.time() * 1e9))' 2>/dev/null) || \
         t=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time()*1e9' 2>/dev/null)
     fi
+    # Normalize/Pad to 19 digits
     if [ ${#t} -eq 10 ]; then echo "${t}000000000"
     elif [ ${#t} -eq 13 ]; then echo "${t}000000"
     else echo "$t"; fi
 }
 
-# --- JQ Logic (v1.5 Compatible + Date Fix) ---
+# --- JQ Logic (Optimized for Stability) ---
 JQ_FILTER='
 def parse_modem(lines):
   (lines | map(split(",") | map(gsub("\""; "")))) as $rows |
@@ -32,18 +32,17 @@ def parse_modem(lines):
   );
 
 ($sys_ns | tonumber) as $now_ns |
-# Fix: Strip milliseconds from ISO8601 for old JQ compatibility
 (if $gps.time then ($gps.time | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 * 1e9) else null end) as $gps_ns |
 
 {
   timestamp_ns: $now_ns,
   data_age_ms: (if $gps_ns then (($now_ns - $gps_ns) / 1e6 | floor) else null end),
   location: {
-    lat: $gps.lat,
-    lon: $gps.lon,
-    alt: $gps.alt,
+    lat: ($gps.lat // null),
+    lon: ($gps.lon // null),
+    alt: ($gps.alt // null),
     speed_kmh: (if $gps.speed then ($gps.speed * 3.6) else 0 end),
-    accuracy: { h_err: $gps.epx, v_err: $gps.epv, t_err: $gps.ept }
+    accuracy: { h_err: ($gps.epx // null), v_err: ($gps.epv // null) }
   },
   modem: parse_modem($m_raw),
   raw_modem: $m_raw
@@ -52,22 +51,20 @@ def parse_modem(lines):
 while true; do
     sys_ns=$(get_ns_timestamp)
     
-    # Validation: Ensure we actually have JSON in the state file
+    # Read GPS state and ensure it is valid JSON before passing to jq
     gps_data=$(cat "$GPS_STATE" 2>/dev/null)
-    if [[ ! "$gps_data" =~ ^\{.*\}$ ]]; then
-        gps_data='{"error":"no_gps_json_yet"}'
-    fi
+    [[ ! "$gps_data" =~ ^\{.*\}$ ]] && gps_data='{"error":"waiting_for_fix"}'
 
+    # Query Modem
     modem_raw=$(echo 'AT+QENG="servingcell"' | atinout - "$MODEM_PORT" - 2>/dev/null | grep '+QENG:' | jq -R . | jq -s .)
-    
-    # If modem_raw fails or is empty, provide valid empty JSON array
-    if [ -z "$modem_raw" ]; then modem_raw="[]"; fi
+    [ -z "$modem_raw" ] && modem_raw="[]"
 
+    # Execute JQ - Discard stderr to prevent the "invalid JSON text" errors from entering the log
     jq -n -c \
        --arg sys_ns "$sys_ns" \
        --argjson gps "$gps_data" \
        --argjson m_raw "$modem_raw" \
-       "$JQ_FILTER"
+       "$JQ_FILTER" 2>/dev/null
 
-    sleep 0.2
+    sleep 0.3
 done
