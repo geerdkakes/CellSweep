@@ -21,23 +21,22 @@ get_ns_timestamp() {
     else echo "$t"; fi
 }
 
-# --- JQ Logic (v1.5 Compatible) ---
+# --- JQ Logic (v1.5 Compatible + Date Fix) ---
 JQ_FILTER='
 def parse_modem(lines):
   (lines | map(split(",") | map(gsub("\""; "")))) as $rows |
   reduce $rows[] as $f ({};
-    if $f[2] == "LTE" then .lte = {tech: "LTE", mcc: $f[3], mnc: $f[4], cellid: $f[5], pcid: $f[6], rsrp: ($f[12]|tonumber), rsrq: ($f[13]|tonumber), sinr: ($f[14]|tonumber)}
-    elif $f[1] == "NR5G-NSA" then .nr5g = {tech: "NR5G-NSA", mcc: $f[2], mnc: $f[3], pcid: $f[4], rsrp: ($f[5]|tonumber), sinr: ($f[7]|tonumber), arfcn: ($f[8]|tonumber)}
+    if $f[2] == "LTE" then .lte = {tech: "LTE", mcc: $f[3], mnc: $f[4], cellid: $f[5], pcid: $f[6], rsrp: ($f[12]|tonumber? // null), rsrq: ($f[13]|tonumber? // null), sinr: ($f[14]|tonumber? // null)}
+    elif $f[1] == "NR5G-NSA" then .nr5g = {tech: "NR5G-NSA", mcc: $f[2], mnc: $f[3], pcid: $f[4], rsrp: ($f[5]|tonumber? // null), sinr: ($f[7]|tonumber? // null), arfcn: ($f[8]|tonumber? // null)}
     else . end
   );
 
 ($sys_ns | tonumber) as $now_ns |
-# Handle possible missing GPS time gracefully
-(if $gps.time then ($gps.time | fromdateiso8601 * 1e9) else null end) as $gps_ns |
+# Fix: Strip milliseconds from ISO8601 for old JQ compatibility
+(if $gps.time then ($gps.time | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 * 1e9) else null end) as $gps_ns |
 
 {
   timestamp_ns: $now_ns,
-  # Replaced "round" with "floor" for jq 1.5 compatibility
   data_age_ms: (if $gps_ns then (($now_ns - $gps_ns) / 1e6 | floor) else null end),
   location: {
     lat: $gps.lat,
@@ -52,8 +51,17 @@ def parse_modem(lines):
 
 while true; do
     sys_ns=$(get_ns_timestamp)
-    gps_data=$(cat "$GPS_STATE" 2>/dev/null || echo '{"error":"no_gps_lock"}')
+    
+    # Validation: Ensure we actually have JSON in the state file
+    gps_data=$(cat "$GPS_STATE" 2>/dev/null)
+    if [[ ! "$gps_data" =~ ^\{.*\}$ ]]; then
+        gps_data='{"error":"no_gps_json_yet"}'
+    fi
+
     modem_raw=$(echo 'AT+QENG="servingcell"' | atinout - "$MODEM_PORT" - 2>/dev/null | grep '+QENG:' | jq -R . | jq -s .)
+    
+    # If modem_raw fails or is empty, provide valid empty JSON array
+    if [ -z "$modem_raw" ]; then modem_raw="[]"; fi
 
     jq -n -c \
        --arg sys_ns "$sys_ns" \
