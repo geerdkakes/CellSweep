@@ -245,7 +245,7 @@ stop_logging() {
         local name=$(get_node_name "$entry")
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
-        kill_procs "" "$user" "$addr" "$name" gpspipe atinout || step1_clean=false
+        kill_procs "" "$user" "$addr" "$name" gps_daemon.sh gpspipe atinout || step1_clean=false
     done
 
     # Even if all scripts stopped cleanly, iperf3 may still be running as an
@@ -283,7 +283,7 @@ stop_logging() {
             local name=$(get_node_name "$entry")
             local user=$(get_node_user "$entry")
             local addr=$(get_node_addr "$entry")
-            kill_procs "" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh iperf3 gpspipe atinout || step3_clean=false
+            kill_procs "" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh gps_daemon.sh iperf3 gpspipe atinout || step3_clean=false
         done
 
         if [ "$step3_clean" = false ]; then
@@ -294,7 +294,7 @@ stop_logging() {
                 local name=$(get_node_name "$entry")
                 local user=$(get_node_user "$entry")
                 local addr=$(get_node_addr "$entry")
-                kill_procs "-9" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh iperf3 gpspipe atinout
+                kill_procs "-9" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh gps_daemon.sh iperf3 gpspipe atinout
             done
         else
             echo "All processes stopped cleanly after step 3, skipping SIGKILL."

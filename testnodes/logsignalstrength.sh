@@ -1,83 +1,66 @@
 #!/usr/bin/env bash
 
-# --- Environment Checks ---
-if [ "${BASH_VERSINFO:-0}" -lt 3 ] || ([ "${BASH_VERSINFO:-0}" -eq 3 ] && [ "${BASH_VERSINFO[1]:-0}" -lt 2 ]); then
-    echo "Error: Bash 3.2 or higher is required." >&2
-    exit 1
-fi
-
-REQUIRED_TOOLS=("awk" "atinout" "gpspipe" "grep" "date" "timeout")
-for tool in "${REQUIRED_TOOLS[@]}"; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        echo "Error: Required tool '$tool' is not installed." >&2
-        exit 1
-    fi
-done
-
-HAS_NANOSECONDS=true
-if ! date +%N | grep -E '^[0-9]+$' >/dev/null; then
-    HAS_NANOSECONDS=false
-fi
-
 # --- Configuration ---
-CONFIG_FILE="$(dirname "$0")/config.env"
-[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 MODEM_PORT=${MODEM_PORT:-/dev/ttyUSB2}
+GPS_STATE="/dev/shm/gps_state.json"
 
-# Define the AWK processor logic
-read -r -d '' PARSE_MODEM_DATA << 'EOF'
-BEGIN { FS=","; OFS="," }
-function handle_sa(ts, gps, raw) { print ts, gps raw }
-function handle_lte(ts, gps, f) {
-    print ts, gps f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[13], f[9], f[10], f[12], f[14], f[15], f[17], "", f[20]
+# Ensure gps_daemon is running; if not, start it
+if ! pgrep -f "gps_daemon.sh" > /dev/null; then
+    $(dirname "$0")/gps_daemon.sh &
+    sleep 1
+fi
+
+# --- Precise Timing Function ---
+get_ns_timestamp() {
+    local t=$(date +%s%N 2>/dev/null)
+    if [[ "$t" == *N* || -z "$t" ]]; then
+        t=$(python3 -c 'import time; print(int(time.time() * 1e9))' 2>/dev/null) || \
+        t=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time()*1e9' 2>/dev/null)
+    fi
+    # Normalize/Pad to 19 digits
+    if [ ${#t} -eq 10 ]; then echo "${t}000000000"
+    elif [ ${#t} -eq 13 ]; then echo "${t}000000"
+    else echo "$t"; fi
 }
-function handle_nsa(ts, gps, f) {
-    print ts, gps "\"servingcell\"", "\"NSA\"", f[1], "", f[2], f[3], "", f[4], "", f[8], f[9], f[10], f[5], f[7], f[6], f[11], ""
-}
+
+# --- JQ Interpretation Logic ---
+JQ_FILTER='
+def parse_modem(lines):
+  (lines | map(split(",") | map(gsub("\""; "")))) as $rows |
+  reduce $rows[] as $f ({};
+    if $f[2] == "LTE" then .lte = {tech: "LTE", mcc: $f[3], mnc: $f[4], cellid: $f[5], pcid: $f[6], rsrp: ($f[12]|tonumber), rsrq: ($f[13]|tonumber), sinr: ($f[14]|tonumber)}
+    elif $f[1] == "NR5G-NSA" then .nr5g = {tech: "NR5G-NSA", mcc: $f[2], mnc: $f[3], pcid: $f[4], rsrp: ($f[5]|tonumber), sinr: ($f[7]|tonumber), arfcn: ($f[8]|tonumber)}
+    else . end
+  );
+
+($sys_ns | tonumber) as $now_ns |
+($gps.time | fromdateiso8601 * 1e9) as $gps_ns |
+
 {
-    gsub(/^\+QENG: /, "", $0)
-    split($0, f, ",")
-    tech = f[3]; type = f[1]
-    gsub(/"/, "", tech); gsub(/"/, "", type)
-    if (tech == "NR5G-SA") handle_sa(ts, gps, $0)
-    else if (tech == "LTE") handle_lte(ts, gps, f)
-    else if (type == "NR5G-NSA") handle_nsa(ts, gps, f)
-}
-EOF
+  timestamp_ns: $now_ns,
+  data_age_ms: (if $gps_ns then (($now_ns - $gps_ns) / 1e6 | round) else null end),
+  location: {
+    lat: $gps.lat,
+    lon: $gps.lon,
+    alt: $gps.alt,
+    speed_kmh: (($gps.speed // 0) * 3.6),
+    accuracy: { h_err: $gps.epx, v_err: $gps.epv, t_err: $gps.ept }
+  },
+  modem: parse_modem($m_raw),
+  raw_modem: $m_raw
+}'
 
 # --- Main Loop ---
-echo "timestamp,lat,lon,cell_type,state,technology,duplex_mode,mcc,mnc,cellid,pcid,tac,arfcn,band,ns_dl_bw,rsrp,rsrq,sinr,scs,srxlev"
-
-LAST_GPS_WARN=0
-
 while true; do
-  if [ "$HAS_NANOSECONDS" = true ]; then
-      timestamp=$(($(date +%s%N)/1000000))
-  else
-      timestamp=$(($(date +%s)*1000))
-  fi
-  
-  # Fetch GPS with a hard timeout to prevent hanging the loop
-  # We look for TPV messages and grab lat/lon. 
-  # Using 'timeout' ensures that if gpspipe doesn't see data, we move on in 0.5s.
-  lat_lon=$(timeout 0.5s gpspipe -w -n 10 2>/dev/null | grep TPV | grep -om1 "[-]\?[[:digit:]]\{1,3\}\.[[:digit:]]\+" | tr '\n' ',')
-  
-  if [ -z "$lat_lon" ]; then
-      lat_lon=","
-      now=$(date +%s)
-      if [ $((now - LAST_GPS_WARN)) -ge 10 ]; then
-          echo "Warning: No GPS fix at $(date)" >&2
-          LAST_GPS_WARN=$now
-      fi
-  fi
+    sys_ns=$(get_ns_timestamp)
+    gps_data=$(cat "$GPS_STATE" 2>/dev/null || echo '{"error":"no_gps_lock"}')
+    modem_raw=$(echo 'AT+QENG="servingcell"' | atinout - "$MODEM_PORT" - 2>/dev/null | grep '+QENG:' | jq -R . | jq -s .)
 
-  # query modem - non-blocking
-  modem_output=$(echo 'AT+QENG="servingcell"' | atinout - "$MODEM_PORT" - 2>/dev/null | grep '+QENG:')
-  
-  if [ -n "$modem_output" ]; then
-      echo "$modem_output" | awk -v ts="$timestamp" -v gps="$lat_lon" "$PARSE_MODEM_DATA"
-  fi
+    jq -n -c \
+       --arg sys_ns "$sys_ns" \
+       --argjson gps "$gps_data" \
+       --argjson m_raw "$modem_raw" \
+       "$JQ_FILTER"
 
-  # Sleep slightly longer to give the CPU/IO a breath
-  sleep 0.2
+    sleep 0.2
 done
