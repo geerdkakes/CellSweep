@@ -174,6 +174,16 @@ timestamp,lat,lon,direction,bitrate_bps
 
 ## Making Maps
 
+load the virtual environment:
+
+```bash
+source map_env/bin/activate
+```
+
+
+
+
+# old text
 The CSVs can be loaded directly into mapping tools:
 
 ### QGIS (recommended)
