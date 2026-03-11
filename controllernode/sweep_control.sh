@@ -102,23 +102,37 @@ generate_session_id() {
 
     # Collect sequences from the local data directory.
     if [ -d "$LOCAL_BASE_DATADIR" ]; then
-        for s in $(ls -1 "$LOCAL_BASE_DATADIR" | grep "^${date_str}_"); do
+        # Use a while loop or local grep to avoid errors if no files exist
+        for s in $(ls -1 "$LOCAL_BASE_DATADIR" 2>/dev/null | grep "^${date_str}_"); do
             local n=$((10#$(_session_seq "$s")))
             [ $n -gt $max_seq ] && max_seq=$n
         done
     fi
 
-    # Collect sequences from each remote node — abort if any node is unreachable.
+    # Collect sequences from each remote node
     for entry in "${NODES[@]}"; do
         local name=$(get_node_name "$entry")
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
-        local remote_sessions
-        remote_sessions=$(run_cmd "$user" "$addr" "ls -1 $REMOTE_BASE_DATADIR 2>/dev/null | grep '^${date_str}_'")
+        
+        # 1. Fetch the raw list of files from the remote node
+        # We only run 'ls' remotely. If 'ls' fails (e.g., connection issue), 
+        # then we trigger the error abort.
+        local remote_output
+        # This checks if the directory exists. If it doesn't, it returns 0 (success) 
+        # with no output, preventing the script from crashing.
+        remote_output=$(run_cmd "$user" "$addr" "[ -d $REMOTE_BASE_DATADIR ] && ls -1 $REMOTE_BASE_DATADIR 2>/dev/null")
+        
         if [ $? -ne 0 ]; then
-            echo "Error: cannot reach $name ($addr) to verify existing sessions. Aborting." >&2
+            echo "Error: cannot reach $name ($addr). Aborting." >&2
             return 1
         fi
+
+        # 2. Filter the output locally.
+        # This prevents the exit status of grep from interfering with the connection check.
+        local remote_sessions
+        remote_sessions=$(echo "$remote_output" | grep "^${date_str}_")
+
         for s in $remote_sessions; do
             local n=$((10#$(_session_seq "$s")))
             [ $n -gt $max_seq ] && max_seq=$n
