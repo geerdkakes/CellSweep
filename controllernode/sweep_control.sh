@@ -93,16 +93,40 @@ kill_procs() {
     [ "$all_stopped" = true ]
 }
 
+# Extract the numeric sequence from a session directory name (e.g. "20260310_04-foo" -> "04").
+_session_seq() { echo "${1#*_}" | cut -d'-' -f1; }
+
 generate_session_id() {
     local date_str=$(date +%Y%m%d)
-    local seq="01"
+    local max_seq=0
+
+    # Collect sequences from the local data directory.
     if [ -d "$LOCAL_BASE_DATADIR" ]; then
-        local last_session=$(ls -1 "$LOCAL_BASE_DATADIR" | grep "^${date_str}_" | sort | tail -n 1)
-        if [ -n "$last_session" ]; then
-            local last_seq=$(echo "$last_session" | cut -d'_' -f2 | cut -d'-' -f1)
-            seq=$(printf "%02d" $((10#$last_seq + 1)))
-        fi
+        for s in $(ls -1 "$LOCAL_BASE_DATADIR" | grep "^${date_str}_"); do
+            local n=$((10#$(_session_seq "$s")))
+            [ $n -gt $max_seq ] && max_seq=$n
+        done
     fi
+
+    # Collect sequences from each remote node — abort if any node is unreachable.
+    for entry in "${NODES[@]}"; do
+        local name=$(get_node_name "$entry")
+        local user=$(get_node_user "$entry")
+        local addr=$(get_node_addr "$entry")
+        local remote_sessions
+        remote_sessions=$(run_cmd "$user" "$addr" "ls -1 $REMOTE_BASE_DATADIR 2>/dev/null | grep '^${date_str}_'")
+        if [ $? -ne 0 ]; then
+            echo "Error: cannot reach $name ($addr) to verify existing sessions. Aborting." >&2
+            return 1
+        fi
+        for s in $remote_sessions; do
+            local n=$((10#$(_session_seq "$s")))
+            [ $n -gt $max_seq ] && max_seq=$n
+        done
+    done
+
+    local seq
+    seq=$(printf "%02d" $((max_seq + 1)))
     echo "${date_str}_${seq}"
 }
 
@@ -130,8 +154,8 @@ prepare_server() {
         if [[ $public_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             for p in $unique_ports; do
                 echo "[$name] Authorizing port $p for $public_ip in AWS SG $AWS_SECURITY_GROUP_ID..."
-                local cmd_tcp="aws ec2 authorize-security-group-ingress --group-id \"$AWS_SECURITY_GROUP_ID\" --protocol tcp --port \"$p\" --cidr \"${public_ip}/32\" --region \"$AWS_REGION\""
-                local cmd_udp="aws ec2 authorize-security-group-ingress --group-id \"$AWS_SECURITY_GROUP_ID\" --protocol udp --port \"$p\" --cidr \"${public_ip}/32\" --region \"$AWS_REGION\""
+                local cmd_tcp="aws ec2 authorize-security-group-ingress --no-cli-pager --group-id \"$AWS_SECURITY_GROUP_ID\" --protocol tcp --port \"$p\" --cidr \"${public_ip}/32\" --region \"$AWS_REGION\""
+                local cmd_udp="aws ec2 authorize-security-group-ingress --no-cli-pager --group-id \"$AWS_SECURITY_GROUP_ID\" --protocol udp --port \"$p\" --cidr \"${public_ip}/32\" --region \"$AWS_REGION\""
 
                 if [ "$DRY_RUN" = "true" ]; then
                     echo "[DRY-RUN] $cmd_tcp"
@@ -149,9 +173,10 @@ prepare_server() {
 
 start_logging() {
     local suffix=$1
-    local session_id=$(generate_session_id)
+    local session_id
+    session_id=$(generate_session_id) || exit 1
     [ -n "$suffix" ] && session_id="${session_id}-${suffix}"
-    
+
     echo "Starting Session: $session_id"
     
     for entry in "${NODES[@]}"; do
@@ -194,6 +219,10 @@ stop_logging() {
     }
 
     # Step 1: SIGTERM the bash scripts and helpers only — NOT iperf3.
+    # We stop first throughput_test.sh on both nodes, this way iperf3 will not
+    # be restarted and it has time to end on its own.
+    # After this we will stop logsignalstrength.sh on both nodes.
+    # The last step is the helper tools gpspipe and atinout. 
     # iperf3 may be in uninterruptible kernel sleep (D-state) during an active
     # network burst; sending any signal while in D-state has no effect. Let it
     # finish its current burst first. Without the scripts running, iperf3 will
@@ -204,12 +233,42 @@ stop_logging() {
         local name=$(get_node_name "$entry")
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
-        kill_procs "" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh gpspipe atinout || step1_clean=false
+        kill_procs "" "$user" "$addr" "$name" throughput_test.sh || step1_clean=false
+    done
+    for entry in "${NODES[@]}"; do
+        local name=$(get_node_name "$entry")
+        local user=$(get_node_user "$entry")
+        local addr=$(get_node_addr "$entry")
+        kill_procs "" "$user" "$addr" "$name" logsignalstrength.sh || step1_clean=false
+    done
+    for entry in "${NODES[@]}"; do
+        local name=$(get_node_name "$entry")
+        local user=$(get_node_user "$entry")
+        local addr=$(get_node_addr "$entry")
+        kill_procs "" "$user" "$addr" "$name" gpspipe atinout || step1_clean=false
     done
 
+    # Even if all scripts stopped cleanly, iperf3 may still be running as an
+    # orphan (its parent script was killed but iperf3 was not signalled).
+    # Check for a running iperf3 on any node before deciding to skip steps 2-4.
     if [ "$step1_clean" = true ]; then
-        echo "All processes stopped cleanly after step 1, skipping steps 2-4."
-    else
+        local iperf3_running=false
+        for entry in "${NODES[@]}"; do
+            local name=$(get_node_name "$entry")
+            local user=$(get_node_user "$entry")
+            local addr=$(get_node_addr "$entry")
+            local result
+            result=$(run_cmd "$user" "$addr" "pgrep -af iperf3 2>/dev/null | grep -v 'pgrep -af'")
+            if [ -n "$result" ]; then
+                echo "  [$name] iperf3 still running as orphan, will wait for burst to finish."
+                iperf3_running=true
+            fi
+        done
+        [ "$iperf3_running" = false ] && echo "All processes stopped cleanly after step 1, skipping steps 2-4."
+        [ "$iperf3_running" = true ] && step1_clean=false
+    fi
+
+    if [ "$step1_clean" = false ]; then
         # Step 2: Wait for iperf3 to finish its current burst naturally. The burst
         # duration is 10s so 15s gives a comfortable margin.
         echo "Step 2: waiting 15s for iperf3 to finish its current burst..."
@@ -256,9 +315,9 @@ stop_logging() {
         if [ -n "$procs" ]; then
             local count
             count=$(echo "$procs" | wc -l | tr -d ' ')
-            echo "  [$name] ERROR: $count process(es) still alive:"
+            echo "  [$name] WARNING: $count process(es) still alive:"
             echo "$procs" | sed "s/^/    [$name] /"
-            echo "  [$name] These may be in uninterruptible D-state. Reboot the node to clear."
+            echo "  [$name] If these persist, they may be in uninterruptible D-state — reboot the node to clear."
             all_clean=false
         else
             echo "  [$name] All processes stopped cleanly."
