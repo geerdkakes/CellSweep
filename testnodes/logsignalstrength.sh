@@ -4,26 +4,24 @@
 MODEM_PORT=${MODEM_PORT:-/dev/ttyUSB2}
 GPS_STATE="/dev/shm/gps_state.json"
 
-# Ensure gps_daemon is running; if not, start it
+# Ensure gps_daemon is running
 if ! pgrep -f "gps_daemon.sh" > /dev/null; then
     $(dirname "$0")/gps_daemon.sh &
     sleep 1
 fi
 
-# --- Precise Timing Function ---
 get_ns_timestamp() {
     local t=$(date +%s%N 2>/dev/null)
     if [[ "$t" == *N* || -z "$t" ]]; then
         t=$(python3 -c 'import time; print(int(time.time() * 1e9))' 2>/dev/null) || \
         t=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time()*1e9' 2>/dev/null)
     fi
-    # Normalize/Pad to 19 digits
     if [ ${#t} -eq 10 ]; then echo "${t}000000000"
     elif [ ${#t} -eq 13 ]; then echo "${t}000000"
     else echo "$t"; fi
 }
 
-# --- JQ Interpretation Logic ---
+# --- JQ Logic (v1.5 Compatible) ---
 JQ_FILTER='
 def parse_modem(lines):
   (lines | map(split(",") | map(gsub("\""; "")))) as $rows |
@@ -34,23 +32,24 @@ def parse_modem(lines):
   );
 
 ($sys_ns | tonumber) as $now_ns |
-($gps.time | fromdateiso8601 * 1e9) as $gps_ns |
+# Handle possible missing GPS time gracefully
+(if $gps.time then ($gps.time | fromdateiso8601 * 1e9) else null end) as $gps_ns |
 
 {
   timestamp_ns: $now_ns,
-  data_age_ms: (if $gps_ns then (($now_ns - $gps_ns) / 1e6 | round) else null end),
+  # Replaced "round" with "floor" for jq 1.5 compatibility
+  data_age_ms: (if $gps_ns then (($now_ns - $gps_ns) / 1e6 | floor) else null end),
   location: {
     lat: $gps.lat,
     lon: $gps.lon,
     alt: $gps.alt,
-    speed_kmh: (($gps.speed // 0) * 3.6),
+    speed_kmh: (if $gps.speed then ($gps.speed * 3.6) else 0 end),
     accuracy: { h_err: $gps.epx, v_err: $gps.epv, t_err: $gps.ept }
   },
   modem: parse_modem($m_raw),
   raw_modem: $m_raw
 }'
 
-# --- Main Loop ---
 while true; do
     sys_ns=$(get_ns_timestamp)
     gps_data=$(cat "$GPS_STATE" 2>/dev/null || echo '{"error":"no_gps_lock"}')
