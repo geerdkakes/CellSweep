@@ -201,7 +201,8 @@ start_logging() {
         local log_file=${remote_dir}/sweep_${name}.csv
 
         echo "[$name] Starting at ${user}@${addr}..."
-        run_bg_cmd "$user" "$addr" "mkdir -p $remote_dir && nohup $REMOTE_SIGNAL_SCRIPT > $remote_dir/signal_${name}.json 2> $remote_dir/signal_${name}.err < /dev/null"
+        # Inside start_logging()
+        run_bg_cmd "$user" "$addr" "mkdir -p $remote_dir && export LOG_FILE=$log_file; nohup $REMOTE_SIGNAL_SCRIPT > $remote_dir/signal_${name}.json 2> $remote_dir/signal_${name}.err </dev/null &"
 
         # 2. Start Throughput Testing if role is assigned
         if [ "$name" == "$DOWNLINK_NODE" ]; then

@@ -1,38 +1,28 @@
 #!/usr/bin/env bash
 
-# --- Configuration ---
 MODEM_PORT=${MODEM_PORT:-/dev/ttyUSB2}
 GPS_STATE="/dev/shm/gps_state.json"
-ERROR_LOG="${LOG_FILE:-/tmp/signal_error_$(date +%s)}.err"
+# If LOG_FILE isn't set by sweep_control, default to temp
+ERR_LOG="${LOG_FILE%.*}.err"
+[ -z "$LOG_FILE" ] && ERR_LOG="/tmp/signal_err.log"
 
-# Ensure log directory exists for error log
-mkdir -p "$(dirname "$ERROR_LOG")"
-exec 2>>"$ERROR_LOG"
+exec 2>>"$ERR_LOG"
 
-log_err() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >&2; }
-
-# Dependency check
-if ! pgrep -f "gps_daemon.sh" > /dev/null; then
-    log_err "Starting gps_daemon.sh..."
-    $(dirname "$0")/gps_daemon.sh >/dev/null 2>&1 &
-fi
+# Set serial port to non-blocking mode to prevent atinout hangs
+stty -F "$MODEM_PORT" -echo -icanon min 0 time 10 2>/dev/null
 
 get_ns_timestamp() {
-    local t=$(date +%s%N 2>/dev/null)
-    if [[ "$t" == *N* || -z "$t" ]]; then
-        t=$(python3 -c 'import time; print(int(time.time() * 1e9))' 2>/dev/null)
-    fi
-    echo "$t"
+    date +%s%N 2>/dev/null | grep -v "N" || python3 -c 'import time; print(int(time.time() * 1e9))'
 }
 
-# --- Robust JQ Logic ---
+# --- Fixed JQ Logic for your specific +QENG output ---
 JQ_FILTER='
 def parse_modem(lines):
   (lines | map(split(",") | map(gsub("\"|\\r"; "")))) as $rows |
   reduce $rows[] as $f ({};
     if $f[1] == "LTE" then 
-        .lte = {mcc: $f[3], mnc: $f[4], cellid: $f[5], rsrp: ($f[12]|tonumber? // null), rsrq: ($f[13]|tonumber? // null), sinr: ($f[14]|tonumber? // null)}
-    elif $f[1] == "NR5G-NSA" then 
+        .lte = {mcc: $f[3], mnc: $f[4], rsrp: ($f[12]|tonumber? // null), rsrq: ($f[13]|tonumber? // null), sinr: ($f[14]|tonumber? // null)}
+    elif $f[0] == "+QENG: NR5G-NSA" or $f[1] == "NR5G-NSA" then 
         .nr5g = {mcc: $f[2], mnc: $f[3], rsrp: ($f[5]|tonumber? // null), sinr: ($f[7]|tonumber? // null), arfcn: ($f[8]|tonumber? // null)}
     else . end
   );
@@ -53,22 +43,18 @@ while true; do
     gps_data=$(cat "$GPS_STATE" 2>/dev/null)
     [[ ! "$gps_data" =~ ^\{.*\}$ ]] && gps_data='{"error":"no_gps_json"}'
 
-    # Improved Modem Capture: Use a temporary variable to hold raw output
-    # The "servingcell" command often returns multiple +QENG lines.
-    raw_response=$(timeout 1.5s atinout - "$MODEM_PORT" - <<<'AT+QENG="servingcell"' 2>/dev/null | grep '+QENG:')
+    # Query Modem with a local log to avoid subshell pipe clogs
+    m_raw_lines=$(timeout 1.2s atinout - "$MODEM_PORT" - <<<'AT+QENG="servingcell"' 2>/dev/null | grep '+QENG:')
     
-    if [ -z "$raw_response" ]; then
-        m_json="[]"
-        m_status="empty_or_timeout"
-        log_err "Modem query failed or timed out."
+    if [ -z "$m_raw_lines" ]; then
+        m_json="[]"; m_status="timeout"
     else
-        # Convert to JSON array: each line becomes an entry in the array
-        m_json=$(echo "$raw_response" | jq -R . | jq -s . 2>/dev/null)
+        m_json=$(echo "$m_raw_lines" | jq -R . | jq -s .)
         m_status="ok"
     fi
 
-    # Output to stdout (captured by signal_apu3.json)
-    jq -n -c \
+    # Force immediate output flush
+    stdbuf -oL jq -n -c \
        --arg sys_ns "$sys_ns" \
        --argjson gps "$gps_data" \
        --argjson m_raw "$m_json" \
