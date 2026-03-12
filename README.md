@@ -34,7 +34,7 @@ Required on each test node (Ubuntu):
 
 | Tool | Purpose |
 |------|---------|
-| `atinout` | Send AT commands to Quectel modem ([source](https://github.com/beralt/atinout)) |
+| `socat` | Send AT commands to Quectel modem and reads responses |
 | Quectel `qmi_wwan_q` driver | Modem connectivity |
 | `gpsd` + `gpspipe` | GPS daemon and data pipe |
 | `iperf3` | Throughput testing (expected at `/usr/local/iperf3/src/iperf3` or on PATH) |
