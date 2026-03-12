@@ -13,6 +13,7 @@ fi
 
 # --- Internal Variables ---
 REMOTE_SIGNAL_SCRIPT="${REMOTE_REPO_ROOT}/testnodes/logsignalstrength.sh"
+REMOTE_GPS_SCRIPT="${REMOTE_REPO_ROOT}/testnodes/gps_logger.sh"
 REMOTE_THROUGHPUT_SCRIPT="${REMOTE_REPO_ROOT}/testnodes/throughput_test.sh"
 
 # Parse Ports
@@ -102,37 +103,23 @@ generate_session_id() {
 
     # Collect sequences from the local data directory.
     if [ -d "$LOCAL_BASE_DATADIR" ]; then
-        # Use a while loop or local grep to avoid errors if no files exist
-        for s in $(ls -1 "$LOCAL_BASE_DATADIR" 2>/dev/null | grep "^${date_str}_"); do
+        for s in $(ls -1 "$LOCAL_BASE_DATADIR" | grep "^${date_str}_"); do
             local n=$((10#$(_session_seq "$s")))
             [ $n -gt $max_seq ] && max_seq=$n
         done
     fi
 
-    # Collect sequences from each remote node
+    # Collect sequences from each remote node — abort if any node is unreachable.
     for entry in "${NODES[@]}"; do
         local name=$(get_node_name "$entry")
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
-        
-        # 1. Fetch the raw list of files from the remote node
-        # We only run 'ls' remotely. If 'ls' fails (e.g., connection issue), 
-        # then we trigger the error abort.
-        local remote_output
-        # This checks if the directory exists. If it doesn't, it returns 0 (success) 
-        # with no output, preventing the script from crashing.
-        remote_output=$(run_cmd "$user" "$addr" "[ -d $REMOTE_BASE_DATADIR ] && ls -1 $REMOTE_BASE_DATADIR 2>/dev/null")
-        
+        local remote_sessions
+        remote_sessions=$(run_cmd "$user" "$addr" "ls -1 $REMOTE_BASE_DATADIR 2>/dev/null | grep '^${date_str}_'")
         if [ $? -ne 0 ]; then
-            echo "Error: cannot reach $name ($addr). Aborting." >&2
+            echo "Error: cannot reach $name ($addr) to verify existing sessions. Aborting." >&2
             return 1
         fi
-
-        # 2. Filter the output locally.
-        # This prevents the exit status of grep from interfering with the connection check.
-        local remote_sessions
-        remote_sessions=$(echo "$remote_output" | grep "^${date_str}_")
-
         for s in $remote_sessions; do
             local n=$((10#$(_session_seq "$s")))
             [ $n -gt $max_seq ] && max_seq=$n
@@ -199,10 +186,14 @@ start_logging() {
         local addr=$(get_node_addr "$entry")
         local remote_dir=${REMOTE_BASE_DATADIR}/${session_id}
         local log_file=${remote_dir}/sweep_${name}.csv
-
+        # 1. Start gps_logger.sh on the remote node to continuously log GPS data, outputting to a session-specific directory. This runs in the background on the remote node.
         echo "[$name] Starting at ${user}@${addr}..."
-        # Inside start_logging()
-        run_bg_cmd "$user" "$addr" "mkdir -p $remote_dir && export LOG_FILE=$log_file; nohup $REMOTE_SIGNAL_SCRIPT > $remote_dir/signal_${name}.json 2> $remote_dir/signal_${name}.err </dev/null &"
+        run_bg_cmd "$user" "$addr" "mkdir -p $remote_dir && nohup $REMOTE_GPS_SCRIPT > $remote_dir/gps_${name}.json 2>&1 < /dev/null"
+
+        # 2. Start logsignalstrength.sh on the remote node to continuously log signal strength data, outputting to the same session-specific directory. This also runs in the background on the remote node.
+        echo "[$name] Starting at ${user}@${addr}..."
+        run_bg_cmd "$user" "$addr" "mkdir -p $remote_dir && nohup $REMOTE_SIGNAL_SCRIPT > $remote_dir/signal_${name}.json 2>&1 < /dev/null"
+
 
         # 2. Start Throughput Testing if role is assigned
         if [ "$name" == "$DOWNLINK_NODE" ]; then
@@ -216,7 +207,7 @@ start_logging() {
     echo "$session_id" > "$(dirname "$0")/.current_session"
 }
 
-STOP_PATTERN="logsignalstrength|throughput_test|iperf3|gpspipe|atinout"
+STOP_PATTERN="logsignalstrength|throughput_test|iperf3|gpspipe|socat"
 
 check_procs() {
     local user=$1 addr=$2
@@ -237,7 +228,7 @@ stop_logging() {
     # We stop first throughput_test.sh on both nodes, this way iperf3 will not
     # be restarted and it has time to end on its own.
     # After this we will stop logsignalstrength.sh on both nodes.
-    # The last step is the helper tools gpspipe and atinout. 
+    # The last step is the helper tools gpspipe and socat. 
     # iperf3 may be in uninterruptible kernel sleep (D-state) during an active
     # network burst; sending any signal while in D-state has no effect. Let it
     # finish its current burst first. Without the scripts running, iperf3 will
@@ -260,7 +251,13 @@ stop_logging() {
         local name=$(get_node_name "$entry")
         local user=$(get_node_user "$entry")
         local addr=$(get_node_addr "$entry")
-        kill_procs "" "$user" "$addr" "$name" gps_daemon.sh gpspipe atinout || step1_clean=false
+        kill_procs "" "$user" "$addr" "$name" gps_logger.sh || step1_clean=false
+    done
+    for entry in "${NODES[@]}"; do
+        local name=$(get_node_name "$entry")
+        local user=$(get_node_user "$entry")
+        local addr=$(get_node_addr "$entry")
+        kill_procs "" "$user" "$addr" "$name" gpspipe socat || step1_clean=false
     done
 
     # Even if all scripts stopped cleanly, iperf3 may still be running as an
@@ -298,7 +295,7 @@ stop_logging() {
             local name=$(get_node_name "$entry")
             local user=$(get_node_user "$entry")
             local addr=$(get_node_addr "$entry")
-            kill_procs "" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh gps_daemon.sh iperf3 gpspipe atinout || step3_clean=false
+            kill_procs "" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh gps_logger.sh iperf3 gpspipe socat || step3_clean=false
         done
 
         if [ "$step3_clean" = false ]; then
@@ -309,7 +306,7 @@ stop_logging() {
                 local name=$(get_node_name "$entry")
                 local user=$(get_node_user "$entry")
                 local addr=$(get_node_addr "$entry")
-                kill_procs "-9" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh gps_daemon.sh iperf3 gpspipe atinout
+                kill_procs "-9" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh gps_logger.sh iperf3 gpspipe socat
             done
         else
             echo "All processes stopped cleanly after step 3, skipping SIGKILL."
