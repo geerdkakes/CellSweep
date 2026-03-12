@@ -112,7 +112,7 @@ Both nodes log continuously. No action needed while driving.
 ./controllernode/sweep_control.sh stop
 ```
 
-Kills all CellSweep processes on all nodes (`logsignalstrength.sh`, `throughput_test.sh`, `iperf3`, `gpspipe`, `atinout`).
+Kills all CellSweep processes on all nodes (`logsignalstrength.sh`, `throughput_test.sh`, 'gps_logger.sh' , `iperf3`, `gpspipe`, `socat`).
 
 ### 5. Fetch data
 
@@ -129,9 +129,19 @@ Data lands in `LOCAL_BASE_DATADIR/<session_id>/`:
 ```
 20260310_01-highway/
   signal_apu3.csv
+  signal_apu3.err
   signal_apu3lte.csv
+  signal_apu3lte.err
+  gps_apu3lte.json
+  gps_apu3lte.err
+  gps_apu3.json
+  gps_apu3.err
   throughput_down_apu3.csv
   throughput_up_apu3lte.csv
+  throughput_down_apu3.json
+  throughput_up_apu3lte.json
+  throughput_down_apu3.err
+  throughput_up_apu3lte.err
 ```
 
 ### 6. Check status (optional)
@@ -150,79 +160,96 @@ DRY_RUN=true ./controllernode/sweep_control.sh start test
 
 ## Output Data Format
 
-### Signal log — `signal_<node>.csv`
+### Signal log — `signal_<node>.json`
 
-Logged at ~200 ms intervals. Supports LTE, 5G NSA, and 5G SA automatically.
+Logged at 1 second intervals. Supports LTE, 5G NSA, and 5G SA automatically.
 
+```json
+{
+  "timestamp_ms": 1773351320485,
+  "modem": {
+    "state": "NOCONN",
+    "lte_anchor": {
+      "is_tdd": "FDD",
+      "mcc": "204",
+      "mnc": "08",
+      "cellid": "158110C",
+      "pcid": "437",
+      "earfcn": "6400",
+      "band": "B20",
+      "ul_bw": "10 MHz",
+      "dl_bw": "10 MHz",
+      "tac": "7B0D",
+      "rsrp": -97,
+      "rsrq": -15,
+      "rssi": -65,
+      "sinr": 9,
+      "cqi": 5,
+      "tx_power": 180,
+      "srxlev": null
+    },
+    "nr5g_nsa": {
+      "mcc": "204",
+      "mnc": "08",
+      "pcid": "889",
+      "rsrp": -97,
+      "sinr": -1,
+      "rsrq": -14,
+      "arfcn": "154570",
+      "band": "n28",
+      "dl_bw": "10 MHz",
+      "scs": "15 kHz"
+    }
+  },
+  "raw_output": "AT+QENG=\"servingcell\"\n+QENG: \"servingcell\",\"NOCONN\"\n+QENG: \"LTE\",\"FDD\",204,08,158110C,437,6400,20,3,3,7B0D,-97,-15,-65,9,5,180,-\n+QENG: \"NR5G-NSA\",204,08,889,-97,-1,-14,154570,28,1,0\n\nOK",
+  "status": {
+    "modem": "ok"
+  }
+}
 ```
-timestamp,lat,lon,cell_type,state,technology,duplex_mode,mcc,mnc,cellid,pcid,tac,arfcn,band,ns_dl_bw,rsrp,rsrq,sinr,scs,srxlev
+
+### GPS log — `gps_<node>.json`
+Logged at 1 second intervals. Contains the latest GPS fix at the time of logging.
+
+```json
+{
+  "os_timestamp_ms": 1773351342505,
+  "class": "SKY",
+  "device": "/dev/ttyS2",
+  "sats_used": 5,
+  "sats_visible": 12,
+  "hdop": 2.13,
+  "vdop": 2.74
+}
+{
+  "os_timestamp_ms": 1773351342554,
+  "class": "TPV",
+  "device": "/dev/ttyS2",
+  "fix_status": "3D",
+  "lat": 52.002362833,
+  "lon": 4.329830333,
+  "alt": 24.6,
+  "speed": 0.078,
+  "track": 0
+}
 ```
 
-Key columns for mapping: `lat`, `lon`, `rsrp` (signal strength dBm), `rsrq`, `sinr`, `technology` (LTE / NR5G-NSA / NR5G-SA), `band`.
 
 ### Throughput log — `throughput_<up|down>_<node>.csv`
 
-One row per completed iperf3 burst. GPS is sampled at the start of each burst.
+One row per completed iperf3 burst. 
 
 ```
-timestamp,lat,lon,direction,bitrate_bps
+timestamp,direction,bitrate_bps,bitrate_mbps
+1773351320485,download,5000000,5.0
 ```
 
 `bitrate_bps = 0` means iperf3 failed to reach the server (firewall, connectivity loss).
 
 ---
 
-## Making Maps
-
-load the virtual environment:
-
-```bash
-source map_env/bin/activate
-```
 
 
 
 
-# old text
-The CSVs can be loaded directly into mapping tools:
 
-### QGIS (recommended)
-
-1. **Layer → Add Layer → Add Delimited Text Layer**
-2. Select the CSV, set geometry: `lat` = Y field, `lon` = X field, CRS = EPSG:4326
-3. Right-click layer → **Properties → Symbology → Graduated**
-4. Classify by: `rsrp` (signal map), `bitrate_bps` (throughput maps)
-5. Choose a colour ramp (e.g. red–yellow–green) and apply
-
-One layer per CSV gives three maps: signal strength, uplink, downlink.
-
-### Python
-
-```python
-import pandas as pd
-import folium
-
-df = pd.read_csv("signal_apu3lte.csv").dropna(subset=["lat", "lon"])
-m = folium.Map(location=[df.lat.mean(), df.lon.mean()], zoom_start=13)
-for _, row in df.iterrows():
-    folium.CircleMarker(
-        [row.lat, row.lon], radius=4,
-        color="red" if row.rsrp < -110 else "orange" if row.rsrp < -95 else "green",
-        fill=True
-    ).add_to(m)
-m.save("signal_map.html")
-```
-
----
-
-## Current Status (March 2026)
-
-All core features implemented and field-tested:
-
-- **SSH backgrounding fixed** — `start` returns immediately; processes run fully detached on nodes
-- **Signal logging** — LTE, 5G NSA, 5G SA auto-detected; ~200 ms sample rate
-- **Throughput logging** — continuous iperf3 bursts with GPS coordinates per burst
-- **GPS in throughput log** — added March 2026; enables direct throughput maps without timestamp joins
-- **Session management** — auto-incrementing session IDs, organised by date
-- **AWS firewall automation** — `prepare_server` whitelists modem IPs before each drive
-- **Reliable fetch** — `rsync` replaces `scp` for robust data retrieval
