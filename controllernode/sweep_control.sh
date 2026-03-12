@@ -243,106 +243,93 @@ stop_logging() {
         return 0
     }
 
-    # Step 1: SIGTERM the bash scripts and helpers only — NOT iperf3.
-    # We stop first throughput_test.sh on both nodes, this way iperf3 will not
-    # be restarted and it has time to end on its own.
-    # After this we will stop logsignalstrength.sh on both nodes.
-    # The last step is the helper tools gpspipe and socat. 
-    # iperf3 may be in uninterruptible kernel sleep (D-state) during an active
-    # network burst; sending any signal while in D-state has no effect. Let it
-    # finish its current burst first. Without the scripts running, iperf3 will
-    # not be restarted after its burst ends.
+    # Returns space-separated list of process names from the given candidates
+    # that are actually running on the remote node.
+    still_running() {
+        local user="$1" addr="$2"; shift 2
+        local candidates=("$@") running=()
+        for proc in "${candidates[@]}"; do
+            run_cmd "$user" "$addr" "pgrep -af '$proc' 2>/dev/null | grep -v 'pgrep -af'" \
+                | grep -q . && running+=("$proc")
+        done
+        echo "${running[@]}"
+    }
+
+    # kill_if_running: like kill_procs but skips processes not alive on the node.
+    # Returns 1 if any targeted process was found (and kill was attempted), 0 otherwise.
+    kill_if_running() {
+        local sig="$1" user="$2" addr="$3" name="$4"; shift 4
+        local alive
+        read -ra alive <<< "$(still_running "$user" "$addr" "$@")"
+        [ "${#alive[@]}" -eq 0 ] && return 0
+        kill_procs "$sig" "$user" "$addr" "$name" "${alive[@]}"
+    }
+
+    # ── Step 1: SIGTERM scripts and helpers only — NOT iperf3. ──────────────
+    # Stop throughput_test.sh first so iperf3 won't be restarted, then
+    # logsignalstrength.sh, gps_logger.sh, and finally gpspipe/socat.
+    # iperf3 may be in D-state during a burst; let it finish on its own.
     echo "Step 1: stopping scripts and helper processes (leaving iperf3 to finish its burst)..."
     local step1_clean=true
-    for entry in "${NODES[@]}"; do
-        local name=$(get_node_name "$entry")
-        local user=$(get_node_user "$entry")
-        local addr=$(get_node_addr "$entry")
-        kill_procs "" "$user" "$addr" "$name" throughput_test.sh || step1_clean=false
-    done
-    for entry in "${NODES[@]}"; do
-        local name=$(get_node_name "$entry")
-        local user=$(get_node_user "$entry")
-        local addr=$(get_node_addr "$entry")
-        kill_procs "" "$user" "$addr" "$name" logsignalstrength.sh || step1_clean=false
-    done
-    for entry in "${NODES[@]}"; do
-        local name=$(get_node_name "$entry")
-        local user=$(get_node_user "$entry")
-        local addr=$(get_node_addr "$entry")
-        kill_procs "" "$user" "$addr" "$name" gps_logger.sh || step1_clean=false
-    done
-    for entry in "${NODES[@]}"; do
-        local name=$(get_node_name "$entry")
-        local user=$(get_node_user "$entry")
-        local addr=$(get_node_addr "$entry")
-        kill_procs "" "$user" "$addr" "$name" gpspipe socat || step1_clean=false
-    done
-
-    # Even if all scripts stopped cleanly, iperf3 may still be running as an
-    # orphan (its parent script was killed but iperf3 was not signalled).
-    # Check for a running iperf3 on any node before deciding to skip steps 2-4.
-    if [ "$step1_clean" = true ]; then
-        local iperf3_running=false
+    local scripts_order=(throughput_test.sh logsignalstrength.sh gps_logger.sh)
+    for proc in "${scripts_order[@]}"; do
         for entry in "${NODES[@]}"; do
-            local name=$(get_node_name "$entry")
-            local user=$(get_node_user "$entry")
-            local addr=$(get_node_addr "$entry")
-            local result
-            result=$(run_cmd "$user" "$addr" "pgrep -af iperf3 2>/dev/null | grep -v 'pgrep -af'")
-            if [ -n "$result" ]; then
-                echo "  [$name] iperf3 still running as orphan, will wait for burst to finish."
-                iperf3_running=true
-            fi
+            local name=$(get_node_name "$entry") user=$(get_node_user "$entry") addr=$(get_node_addr "$entry")
+            kill_if_running "" "$user" "$addr" "$name" "$proc" || step1_clean=false
         done
-        [ "$iperf3_running" = false ] && echo "All processes stopped cleanly after step 1, skipping steps 2-4."
-        [ "$iperf3_running" = true ] && step1_clean=false
-    fi
+    done
+    for entry in "${NODES[@]}"; do
+        local name=$(get_node_name "$entry") user=$(get_node_user "$entry") addr=$(get_node_addr "$entry")
+        kill_if_running "" "$user" "$addr" "$name" gpspipe socat || step1_clean=false
+    done
 
-    if [ "$step1_clean" = false ]; then
-        # Step 2: Wait for iperf3 to finish its current burst naturally. The burst
-        # duration is 10s so 15s gives a comfortable margin.
+    # Check for orphaned iperf3 even when scripts stopped cleanly.
+    local iperf3_running=false
+    for entry in "${NODES[@]}"; do
+        local name=$(get_node_name "$entry") user=$(get_node_user "$entry") addr=$(get_node_addr "$entry")
+        if run_cmd "$user" "$addr" "pgrep -af iperf3 2>/dev/null | grep -v 'pgrep -af'" | grep -q .; then
+            echo "  [$name] iperf3 still running as orphan, will wait for burst to finish."
+            iperf3_running=true
+        fi
+    done
+
+    if [ "$step1_clean" = true ] && [ "$iperf3_running" = false ]; then
+        echo "All processes stopped cleanly after step 1, skipping steps 2-4."
+    else
+        # ── Step 2: Wait for iperf3 to finish its burst naturally (10s burst → 15s margin).
         echo "Step 2: waiting 15s for iperf3 to finish its current burst..."
         sleep 15
 
-        # Step 3: SIGTERM everything still running. iperf3 is now between bursts
-        # (no longer in D-state), so SIGTERM will be effective. Bash scripts that
-        # deferred their earlier SIGTERM are also caught here.
+        # ── Step 3: SIGTERM whatever is still alive. ─────────────────────────
+        # Scripts that deferred their earlier SIGTERM are also caught here.
         echo "Step 3: sending SIGTERM to all remaining processes..."
+        local all_procs=(logsignalstrength.sh throughput_test.sh gps_logger.sh iperf3 gpspipe socat)
         local step3_clean=true
         for entry in "${NODES[@]}"; do
-            local name=$(get_node_name "$entry")
-            local user=$(get_node_user "$entry")
-            local addr=$(get_node_addr "$entry")
-            kill_procs "" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh gps_logger.sh iperf3 gpspipe socat || step3_clean=false
+            local name=$(get_node_name "$entry") user=$(get_node_user "$entry") addr=$(get_node_addr "$entry")
+            kill_if_running "" "$user" "$addr" "$name" "${all_procs[@]}" || step3_clean=false
         done
 
         if [ "$step3_clean" = false ]; then
-            # Step 4: SIGTERM did not clear all processes — wait 5s more then SIGKILL.
+            # ── Step 4: SIGKILL the survivors. ───────────────────────────────
             echo "Step 4: waiting 5s then sending SIGKILL to remaining processes..."
             sleep 5
             for entry in "${NODES[@]}"; do
-                local name=$(get_node_name "$entry")
-                local user=$(get_node_user "$entry")
-                local addr=$(get_node_addr "$entry")
-                kill_procs "-9" "$user" "$addr" "$name" logsignalstrength.sh throughput_test.sh gps_logger.sh iperf3 gpspipe socat
+                local name=$(get_node_name "$entry") user=$(get_node_user "$entry") addr=$(get_node_addr "$entry")
+                kill_if_running "-9" "$user" "$addr" "$name" "${all_procs[@]}"
             done
         else
             echo "All processes stopped cleanly after step 3, skipping SIGKILL."
         fi
     fi
 
-    # Final verification: all CellSweep processes must be gone.
+    # ── Final verification ───────────────────────────────────────────────────
     echo "Verifying all processes have stopped..."
     local all_clean=true
     for entry in "${NODES[@]}"; do
-        local name=$(get_node_name "$entry")
-        local user=$(get_node_user "$entry")
-        local addr=$(get_node_addr "$entry")
-
+        local name=$(get_node_name "$entry") user=$(get_node_user "$entry") addr=$(get_node_addr "$entry")
         local procs
         procs=$(check_procs "$user" "$addr")
-
         if [ -n "$procs" ]; then
             local count
             count=$(echo "$procs" | wc -l | tr -d ' ')
