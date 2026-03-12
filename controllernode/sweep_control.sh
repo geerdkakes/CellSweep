@@ -187,21 +187,40 @@ start_logging() {
         local remote_dir=${REMOTE_BASE_DATADIR}/${session_id}
         local log_file=${remote_dir}/sweep_${name}.csv
         # 1. Start gps_logger.sh on the remote node to continuously log GPS data, outputting to a session-specific directory. This runs in the background on the remote node.
-        echo "[$name] Starting at ${user}@${addr}..."
-        run_bg_cmd "$user" "$addr" "mkdir -p $remote_dir && nohup $REMOTE_GPS_SCRIPT > $remote_dir/gps_${name}.json 2>&1 < /dev/null"
-
+        echo "[$name] Starting gps_logger at  ${user}@${addr}..."
+        
+        run_bg_cmd "$user" "$addr" \
+                    "mkdir -p $remote_dir && \
+                    nohup $REMOTE_GPS_SCRIPT \
+                         > $remote_dir/gps_${name}.json \
+                         2> $remote_dir/gps_${name}.err < /dev/null"
+        
         # 2. Start logsignalstrength.sh on the remote node to continuously log signal strength data, outputting to the same session-specific directory. This also runs in the background on the remote node.
-        echo "[$name] Starting at ${user}@${addr}..."
-        run_bg_cmd "$user" "$addr" "mkdir -p $remote_dir && nohup $REMOTE_SIGNAL_SCRIPT > $remote_dir/signal_${name}.json 2>&1 < /dev/null"
+        echo "[$name] Starting logsignalstrength at ${user}@${addr}..."
+        run_bg_cmd "$user" "$addr" \
+                    "nohup $REMOTE_SIGNAL_SCRIPT \
+                         > $remote_dir/signal_${name}.json \
+                         2> $remote_dir/signal_${name}.err < /dev/null"
 
 
         # 2. Start Throughput Testing if role is assigned
         if [ "$name" == "$DOWNLINK_NODE" ]; then
             echo "[$name] Starting DOWNLINK tests against $IPERF_SERVER on port $PORT_DOWN..."
-            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT download $IPERF_SERVER $BURST_DURATION $PORT_DOWN ${BURST_INTERVAL:-1} $remote_dir/throughput_down_${name}.jsonl > $remote_dir/throughput_down_${name}.csv 2>&1 < /dev/null"
+            run_bg_cmd "$user" "$addr" \
+                    "nohup $REMOTE_THROUGHPUT_SCRIPT download \
+                    $IPERF_SERVER $BURST_DURATION $PORT_DOWN \
+                    ${BURST_INTERVAL:-1} $remote_dir/throughput_down_${name}.jsonl \
+                    > $remote_dir/throughput_down_${name}.csv \
+                    2> $remote_dir/throughput_down_${name}.err < /dev/null"
+                    
         elif [ "$name" == "$UPLINK_NODE" ]; then
             echo "[$name] Starting UPLINK tests against $IPERF_SERVER on port $PORT_UP..."
-            run_bg_cmd "$user" "$addr" "nohup $REMOTE_THROUGHPUT_SCRIPT upload $IPERF_SERVER $BURST_DURATION $PORT_UP ${BURST_INTERVAL:-1} $remote_dir/throughput_up_${name}.jsonl > $remote_dir/throughput_up_${name}.csv 2>&1 < /dev/null"
+            run_bg_cmd "$user" "$addr" \
+                    "nohup $REMOTE_THROUGHPUT_SCRIPT upload \
+                    $IPERF_SERVER $BURST_DURATION $PORT_UP \
+                    ${BURST_INTERVAL:-1} $remote_dir/throughput_up_${name}.jsonl \
+                    > $remote_dir/throughput_down_${name}.csv \
+                    2> $remote_dir/throughput_down_${name}.err < /dev/null"
         fi
     done
     echo "$session_id" > "$(dirname "$0")/.current_session"
