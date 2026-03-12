@@ -32,7 +32,7 @@ fi
 IPERF_FLAGS="-J -t $DURATION -p $PORT"
 [ "$DIRECTION" == "download" ] && IPERF_FLAGS="$IPERF_FLAGS -R"
 
-echo "timestamp,direction,bitrate_bps"
+echo "timestamp,direction,bitrate_bps,bitrate_mbps"
 
 while true; do
     # Timestamp at start of burst
@@ -48,15 +48,20 @@ while true; do
         else
             bitrate=$(echo "$result" | jq '.end.sum_sent.bits_per_second // 0'  2> >(cat >&2))
         fi
+
+        # Calculate Mbps (bitrate / 1,000,000)
+        mbps=$(echo "$bitrate" | jq '. / 1000000')
+
         # Append compact JSON with timestamp and direction added for correlation
         if [ -n "$JSON_LOG" ]; then
             echo "$result" | jq -c ". + {burst_timestamp: $sys_ms, direction: \"$DIRECTION\"}" >> "$JSON_LOG"
         fi
     else
         bitrate=0
+        mbps=0
     fi
 
-    echo "${sys_ms},${DIRECTION},${bitrate}"
+    echo "${sys_ms},${DIRECTION},${bitrate},${mbps}"
 
     sleep "$INTERVAL"
 done
